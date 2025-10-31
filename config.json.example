@@ -80,5 +80,12 @@
   "api_server_port": 8080,
   "max_daily_loss": 10.0,
   "max_drawdown": 20.0,
-  "stop_trading_minutes": 60
+  "stop_trading_minutes": 60,
+  "auth": {
+    "enabled": true,
+    "username": "admin",
+    "password": "change_me",
+    "token_secret": "replace_with_a_secure_random_string",
+    "token_ttl_minutes": 720
+  }
 }

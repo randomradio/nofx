@@ -11,7 +11,7 @@ import (
 type TraderConfig struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
-	Enabled bool   `json:"enabled"` // 是否启用该trader
+	Enabled bool   `json:"enabled"`  // 是否启用该trader
 	AIModel string `json:"ai_model"` // "qwen" or "deepseek"
 
 	// 交易平台选择（二选一）
@@ -62,6 +62,16 @@ type Config struct {
 	MaxDrawdown        float64        `json:"max_drawdown"`
 	StopTradingMinutes int            `json:"stop_trading_minutes"`
 	Leverage           LeverageConfig `json:"leverage"` // 杠杆配置
+	Auth               AuthConfig     `json:"auth"`
+}
+
+// AuthConfig API认证配置
+type AuthConfig struct {
+	Enabled         bool   `json:"enabled"`
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	TokenSecret     string `json:"token_secret"`
+	TokenTTLMinutes int    `json:"token_ttl_minutes"`
 }
 
 // LoadConfig 从文件加载配置
@@ -190,6 +200,26 @@ func (c *Config) Validate() error {
 	}
 	if c.Leverage.AltcoinLeverage > 5 {
 		fmt.Printf("⚠️  警告: 山寨币杠杆设置为%dx，如果使用子账户可能会失败（子账户限制≤5x）\n", c.Leverage.AltcoinLeverage)
+	}
+
+	// 处理认证配置
+	if c.Auth.Username != "" || c.Auth.Password != "" || c.Auth.Enabled {
+		c.Auth.Enabled = true
+	}
+	if c.Auth.Enabled {
+		if c.Auth.Username == "" {
+			return fmt.Errorf("auth.username不能为空（启用认证时）")
+		}
+		if c.Auth.Password == "" {
+			return fmt.Errorf("auth.password不能为空（启用认证时）")
+		}
+		if c.Auth.TokenTTLMinutes <= 0 {
+			c.Auth.TokenTTLMinutes = 720 // 默认12小时
+		}
+		if c.Auth.TokenSecret == "" {
+			// 如果未配置自定义secret，则使用密码作为fallback
+			c.Auth.TokenSecret = c.Auth.Password
+		}
 	}
 
 	return nil

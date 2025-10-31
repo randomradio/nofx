@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
-import { api } from './lib/api';
+import { api, clearAuthSession, getStoredExpiry, getStoredToken, saveAuthSession, setUnauthorizedHandler, type LoginResponse } from './lib/api';
 import { EquityChart } from './components/EquityChart';
 import { CompetitionPage } from './components/CompetitionPage';
 import AILearning from './components/AILearning';
+import { LoginForm } from './components/LoginForm';
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext';
 import { t, type Language } from './i18n/translations';
 import type {
@@ -29,6 +30,37 @@ function App() {
   const [currentPage, setCurrentPage] = useState<Page>(getInitialPage());
   const [selectedTraderId, setSelectedTraderId] = useState<string | undefined>();
   const [lastUpdate, setLastUpdate] = useState<string>('--:--:--');
+  const [authToken, setAuthToken] = useState<string | null>(() => getStoredToken());
+  const [tokenExpiry, setTokenExpiry] = useState<string | null>(() => getStoredExpiry());
+  const [authRequired, setAuthRequired] = useState<boolean>(() => !getStoredToken());
+
+  const handleUnauthorized = useCallback(() => {
+    clearAuthSession();
+    setAuthToken(null);
+    setTokenExpiry(null);
+    setAuthRequired(true);
+    setSelectedTraderId(undefined);
+  }, []);
+
+  useEffect(() => {
+    setUnauthorizedHandler(handleUnauthorized);
+    return () => {
+      setUnauthorizedHandler(null);
+    };
+  }, [handleUnauthorized]);
+
+  const handleLoginSuccess = useCallback((session: LoginResponse) => {
+    saveAuthSession(session.token, session.expires_at);
+    setAuthToken(session.token);
+    setTokenExpiry(session.expires_at ?? null);
+    setAuthRequired(false);
+    setSelectedTraderId(undefined);
+    setLastUpdate('--:--:--');
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    handleUnauthorized();
+  }, [handleUnauthorized]);
 
   // 监听URL hash变化，同步页面状态
   useEffect(() => {
@@ -51,8 +83,10 @@ function App() {
     window.location.hash = page === 'competition' ? '' : 'trader';
   };
 
+  const canFetch = !!authToken;
+
   // 获取trader列表
-  const { data: traders } = useSWR<TraderInfo[]>('traders', api.getTraders, {
+  const { data: traders } = useSWR<TraderInfo[]>(canFetch ? 'traders' : null, api.getTraders, {
     refreshInterval: 10000,
   });
 
@@ -65,7 +99,7 @@ function App() {
 
   // 如果在trader页面，获取该trader的数据
   const { data: status } = useSWR<SystemStatus>(
-    currentPage === 'trader' && selectedTraderId
+    canFetch && currentPage === 'trader' && selectedTraderId
       ? `status-${selectedTraderId}`
       : null,
     () => api.getStatus(selectedTraderId),
@@ -77,7 +111,7 @@ function App() {
   );
 
   const { data: account } = useSWR<AccountInfo>(
-    currentPage === 'trader' && selectedTraderId
+    canFetch && currentPage === 'trader' && selectedTraderId
       ? `account-${selectedTraderId}`
       : null,
     () => api.getAccount(selectedTraderId),
@@ -89,7 +123,7 @@ function App() {
   );
 
   const { data: positions } = useSWR<Position[]>(
-    currentPage === 'trader' && selectedTraderId
+    canFetch && currentPage === 'trader' && selectedTraderId
       ? `positions-${selectedTraderId}`
       : null,
     () => api.getPositions(selectedTraderId),
@@ -101,7 +135,7 @@ function App() {
   );
 
   const { data: decisions } = useSWR<DecisionRecord[]>(
-    currentPage === 'trader' && selectedTraderId
+    canFetch && currentPage === 'trader' && selectedTraderId
       ? `decisions/latest-${selectedTraderId}`
       : null,
     () => api.getLatestDecisions(selectedTraderId),
@@ -113,7 +147,7 @@ function App() {
   );
 
   const { data: stats } = useSWR<Statistics>(
-    currentPage === 'trader' && selectedTraderId
+    canFetch && currentPage === 'trader' && selectedTraderId
       ? `statistics-${selectedTraderId}`
       : null,
     () => api.getStatistics(selectedTraderId),
@@ -131,7 +165,28 @@ function App() {
     }
   }, [account]);
 
+  const tokenExpiryDisplay = useMemo(() => {
+    if (!tokenExpiry) {
+      return '';
+    }
+    const expiryDate = new Date(tokenExpiry);
+    if (Number.isNaN(expiryDate.getTime())) {
+      return '';
+    }
+    return expiryDate.toLocaleString();
+  }, [tokenExpiry]);
+
   const selectedTrader = traders?.find((t) => t.trader_id === selectedTraderId);
+
+  if (authRequired && !authToken) {
+    return (
+      <LoginForm
+        language={language}
+        onSuccess={handleLoginSuccess}
+        onLanguageChange={setLanguage}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen" style={{ background: '#0B0E11', color: '#EAECEF' }}>
@@ -228,6 +283,28 @@ function App() {
                   {t('details', language)}
                 </button>
               </div>
+
+              {/* Token Expiry */}
+              {authToken && tokenExpiry && (
+                <div
+                  className="hidden md:flex items-center gap-1 px-3 py-1.5 rounded text-xs font-mono"
+                  style={{ background: '#1E2329', color: '#848E9C', border: '1px solid #2B3139' }}
+                >
+                  <span>Token</span>
+                  <span style={{ color: '#F0B90B' }}>{tokenExpiryDisplay}</span>
+                </div>
+              )}
+
+              {/* Logout */}
+              {authToken && (
+                <button
+                  onClick={handleLogout}
+                  className="px-3 py-1.5 rounded text-xs font-semibold transition-all"
+                  style={{ background: '#F6465D', color: '#000' }}
+                >
+                  退出
+                </button>
+              )}
 
               {/* Trader Selector (only show on trader page) */}
               {currentPage === 'trader' && traders && traders.length > 0 && (

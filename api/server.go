@@ -1,12 +1,23 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"nofx/config"
 	"nofx/manager"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Server HTTP API服务器
@@ -14,10 +25,16 @@ type Server struct {
 	router        *gin.Engine
 	traderManager *manager.TraderManager
 	port          int
+
+	authEnabled  bool
+	authUsername string
+	passwordHash []byte
+	tokenSecret  []byte
+	tokenTTL     time.Duration
 }
 
 // NewServer 创建API服务器
-func NewServer(traderManager *manager.TraderManager, port int) *Server {
+func NewServer(traderManager *manager.TraderManager, port int, authCfg config.AuthConfig) (*Server, error) {
 	// 设置为Release模式（减少日志输出）
 	gin.SetMode(gin.ReleaseMode)
 
@@ -32,10 +49,25 @@ func NewServer(traderManager *manager.TraderManager, port int) *Server {
 		port:          port,
 	}
 
+	if authCfg.Enabled {
+		hash, err := bcrypt.GenerateFromPassword([]byte(authCfg.Password), bcrypt.DefaultCost)
+		if err != nil {
+			return nil, fmt.Errorf("生成密码哈希失败: %w", err)
+		}
+		s.authEnabled = true
+		s.authUsername = authCfg.Username
+		s.passwordHash = hash
+		s.tokenSecret = []byte(authCfg.TokenSecret)
+		if authCfg.TokenTTLMinutes <= 0 {
+			authCfg.TokenTTLMinutes = 720
+		}
+		s.tokenTTL = time.Duration(authCfg.TokenTTLMinutes) * time.Minute
+	}
+
 	// 设置路由
 	s.setupRoutes()
 
-	return s
+	return s, nil
 }
 
 // corsMiddleware CORS中间件
@@ -59,8 +91,13 @@ func (s *Server) setupRoutes() {
 	// 健康检查
 	s.router.Any("/health", s.handleHealth)
 
+	s.router.POST("/auth/login", s.handleLogin)
+
 	// API路由组
 	api := s.router.Group("/api")
+	if s.authEnabled {
+		api.Use(s.authMiddleware())
+	}
 	{
 		// 竞赛总览
 		api.GET("/competition", s.handleCompetition)
@@ -78,6 +115,66 @@ func (s *Server) setupRoutes() {
 		api.GET("/equity-history", s.handleEquityHistory)
 		api.GET("/performance", s.handlePerformance)
 	}
+}
+
+// authMiddleware 鉴权中间件
+func (s *Server) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing authorization header"})
+			return
+		}
+
+		tokenString := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		if err := s.validateToken(tokenString); err != nil {
+			log.Printf("⚠️  Token验证失败: %v", err)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// handleLogin 登录接口
+func (s *Server) handleLogin(c *gin.Context) {
+	if !s.authEnabled {
+		c.JSON(http.StatusNotFound, gin.H{"error": "authentication disabled"})
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+
+	if subtle.ConstantTimeCompare([]byte(req.Username), []byte(s.authUsername)) != 1 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword(s.passwordHash, []byte(req.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+		return
+	}
+
+	tokenString, expiresAt, err := s.issueToken()
+	if err != nil {
+		log.Printf("❌ 生成token失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"token":      tokenString,
+		"expires_at": expiresAt.UTC().Format(time.RFC3339),
+		"expires_in": int(s.tokenTTL.Seconds()),
+	})
 }
 
 // handleHealth 健康检查
@@ -418,6 +515,93 @@ func (s *Server) Start() error {
 	log.Printf("  • GET  /api/performance?trader_id=xxx - 指定trader的AI学习表现分析")
 	log.Printf("  • GET  /health               - 健康检查")
 	log.Println()
+	if s.authEnabled {
+		log.Printf("🔐 已启用API认证，用户名: %s", s.authUsername)
+		log.Println()
+	}
 
 	return s.router.Run(addr)
+}
+
+type tokenPayload struct {
+	Username string `json:"u"`
+	IssuedAt int64  `json:"iat"`
+	Expires  int64  `json:"exp"`
+	Nonce    string `json:"n"`
+}
+
+func (s *Server) issueToken() (string, time.Time, error) {
+	now := time.Now()
+	expiresAt := now.Add(s.tokenTTL)
+
+	randomBytes := make([]byte, 16)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", time.Time{}, fmt.Errorf("生成随机数失败: %w", err)
+	}
+
+	payload := tokenPayload{
+		Username: s.authUsername,
+		IssuedAt: now.Unix(),
+		Expires:  expiresAt.Unix(),
+		Nonce:    base64.RawURLEncoding.EncodeToString(randomBytes),
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("序列化token失败: %w", err)
+	}
+
+	signature := s.signToken(payloadBytes)
+	token := fmt.Sprintf("%s.%s",
+		base64.RawURLEncoding.EncodeToString(payloadBytes),
+		base64.RawURLEncoding.EncodeToString(signature),
+	)
+
+	return token, expiresAt, nil
+}
+
+func (s *Server) validateToken(token string) error {
+	if token == "" {
+		return errors.New("token为空")
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return errors.New("token格式错误")
+	}
+
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return fmt.Errorf("token解码失败: %w", err)
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fmt.Errorf("签名解码失败: %w", err)
+	}
+
+	expectedSig := s.signToken(payloadBytes)
+	if len(expectedSig) != len(sigBytes) ||
+		subtle.ConstantTimeCompare(expectedSig, sigBytes) != 1 {
+		return errors.New("签名无效")
+	}
+
+	var payload tokenPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return fmt.Errorf("解析token失败: %w", err)
+	}
+
+	if subtle.ConstantTimeCompare([]byte(payload.Username), []byte(s.authUsername)) != 1 {
+		return errors.New("用户名不匹配")
+	}
+
+	if time.Now().Unix() > payload.Expires {
+		return errors.New("token已过期")
+	}
+
+	return nil
+}
+
+func (s *Server) signToken(data []byte) []byte {
+	mac := hmac.New(sha256.New, s.tokenSecret)
+	mac.Write(data)
+	return mac.Sum(nil)
 }

@@ -628,11 +628,29 @@ For running multiple AI traders competing against each other:
 | `coin_pool_api_url` | Custom coin pool API<br>*Only needed when `use_default_coins: false`* | `""` (empty) | ❌ No |
 | `oi_top_api_url` | Open interest API<br>*Optional supplement data* | `""` (empty) | ❌ No |
 | `api_server_port` | Web dashboard port | `8080` | ✅ Yes |
+| `auth` | Dashboard authentication config (username/password login) | `{"enabled": true, ...}` | ❌ No |
 
 **Default Trading Coins** (when `use_default_coins: true`):
 - BTC, ETH, SOL, BNB, XRP, DOGE, ADA, HYPE
 
 ---
+
+**Authentication Configuration (`auth`)**
+
+```json
+"auth": {
+  "enabled": true,
+  "username": "admin",
+  "password": "change_me",
+  "token_secret": "replace_with_a_secure_random_string",
+  "token_ttl_minutes": 720
+}
+```
+
+- Set `enabled` to `true` to protect the REST API & dashboard
+- `username` / `password` are used on the login screen
+- `token_secret` is used to sign session tokens (defaults to password if omitted)
+- `token_ttl_minutes` controls session lifetime (default 720 minutes)
 
 #### ⚙️ Leverage Configuration (v2.0.3+)
 

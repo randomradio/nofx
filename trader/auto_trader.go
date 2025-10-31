@@ -298,7 +298,8 @@ func (at *AutoTrader) runCycle() error {
 			record.DecisionJSON = string(decisionJSON)
 		}
 	}
-
+	
+	log.Printf("获取决策结果: %v, %w", decision, err)
 	if err != nil {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("获取AI决策失败: %v", err)
