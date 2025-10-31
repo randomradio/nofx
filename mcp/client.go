@@ -36,7 +36,7 @@ func New() *Client {
 		Provider: ProviderDeepSeek,
 		BaseURL:  "https://api.deepseek.com/v1",
 		Model:    "deepseek-chat",
-		Timeout:  120 * time.Second, // 增加到120秒，因为AI需要分析大量数据
+		Timeout:  300 * time.Second, // 增加到300秒，适配更大的输出令牌
 	}
 	return &defaultClient
 }
@@ -73,7 +73,7 @@ func (cfg *Client) SetCustomAPI(apiURL, apiKey, modelName string) {
 	}
 
 	cfg.Model = modelName
-	cfg.Timeout = 120 * time.Second
+	cfg.Timeout = 300 * time.Second
 }
 
 // SetClient 设置完整的AI配置（高级用户）
@@ -88,6 +88,11 @@ func (cfg *Client) SetClient(Client Client) {
 func (cfg *Client) CallWithMessages(systemPrompt, userPrompt string) (string, error) {
 	if cfg.APIKey == "" {
 		return "", fmt.Errorf("AI API密钥未设置，请先调用 SetDeepSeekAPIKey() 或 SetQwenAPIKey()")
+	}
+
+	// 确保有足够的上下文超时时间（大输出场景）
+	if cfg.Timeout < 300*time.Second {
+		cfg.Timeout = 300 * time.Second
 	}
 
 	// 重试配置
