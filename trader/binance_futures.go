@@ -77,6 +77,14 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 	return result, nil
 }
 
+// invalidatePositionsCache 使持仓缓存失效，下一次获取将强制走API
+func (t *FuturesTrader) invalidatePositionsCache() {
+    t.positionsCacheMutex.Lock()
+    t.cachedPositions = nil
+    t.positionsCacheTime = time.Time{}
+    t.positionsCacheMutex.Unlock()
+}
+
 // GetPositions 获取所有持仓（带缓存）
 func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 	// 先检查缓存是否有效
@@ -296,6 +304,8 @@ func (t *FuturesTrader) OpenShort(symbol string, quantity float64, leverage int)
 
 // CloseLong 平多仓
 func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
+    // 关键：平仓前强制刷新一次持仓，避免命中缓存
+    t.invalidatePositionsCache()
 	// 如果数量为0，获取当前持仓数量
 	if quantity == 0 {
 		positions, err := t.GetPositions()
@@ -350,6 +360,8 @@ func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]i
 
 // CloseShort 平空仓
 func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
+    // 关键：平仓前强制刷新一次持仓，避免命中缓存
+    t.invalidatePositionsCache()
 	// 如果数量为0，获取当前持仓数量
 	if quantity == 0 {
 		positions, err := t.GetPositions()

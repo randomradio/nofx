@@ -681,10 +681,18 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 平仓
-	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
-	if err != nil {
-		return err
-	}
+    order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
+    if err != nil {
+        // 已无多仓的情况视为已平仓，清理挂单后返回成功
+        if strings.Contains(err.Error(), "没有找到") && strings.Contains(err.Error(), "多仓") {
+            log.Printf("  ℹ %s 已无多仓，视为已平仓", decision.Symbol)
+            if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
+                log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
+            }
+            return nil
+        }
+        return err
+    }
 
 	// 记录订单ID
 	if orderID, ok := order["orderId"].(int64); ok {
@@ -707,10 +715,18 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 平仓
-	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
-	if err != nil {
-		return err
-	}
+    order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
+    if err != nil {
+        // 已无空仓的情况视为已平仓，清理挂单后返回成功
+        if strings.Contains(err.Error(), "没有找到") && strings.Contains(err.Error(), "空仓") {
+            log.Printf("  ℹ %s 已无空仓，视为已平仓", decision.Symbol)
+            if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
+                log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
+            }
+            return nil
+        }
+        return err
+    }
 
 	// 记录订单ID
 	if orderID, ok := order["orderId"].(int64); ok {
