@@ -626,9 +626,11 @@ For running multiple AI traders competing against each other:
 | `altcoin_leverage` | Maximum leverage for altcoins<br>⚠️ Subaccounts: ≤5x | `5` (default, safe)<br>`20` (main account max) | ✅ Yes |
 | `use_default_coins` | Use built-in coin list<br>**✨ Smart Default: `true`** (v2.0.2+)<br>Auto-enabled if no API URL provided | `true` or omit | ❌ No<br>(Optional, auto-defaults) |
 | `coin_pool_api_url` | Custom coin pool API<br>*Only needed when `use_default_coins: false`* | `""` (empty) | ❌ No |
-| `oi_top_api_url` | Open interest API<br>*Optional supplement data* | `""` (empty) | ❌ No |
+| `oi_top_api_url` | Open interest API<br>`binance` (default) uses Binance official open-interest endpoint | `"binance"` | ❌ No |
 | `api_server_port` | Web dashboard port | `8080` | ✅ Yes |
 | `auth` | Dashboard authentication config (username/password login) | `{"enabled": true, ...}` | ❌ No |
+
+> ℹ️ Leave `oi_top_api_url` empty or set to `binance` to let NOFX query Binance's official open-interest API (`/fapi/v1/openInterest`). Provide a full URL if you want to keep using a custom OI service, or set it to `none` if you want to disable OI-based enrichment entirely.
 
 **Default Trading Coins** (when `use_default_coins: true`):
 - BTC, ETH, SOL, BNB, XRP, DOGE, ADA, HYPE

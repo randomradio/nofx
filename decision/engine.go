@@ -420,6 +420,7 @@ func buildUserPrompt(ctx *Context) string {
 func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
+	fmt.Printf("ai response: %s, \n CoT: %s", aiResponse)
 
 	// 2. 提取JSON决策列表
 	decisions, err := extractDecisions(aiResponse)

@@ -48,10 +48,7 @@ func main() {
 		pool.SetCoinPoolAPI(cfg.CoinPoolAPIURL)
 		log.Printf("✓ 已配置AI500币种池API")
 	}
-	if cfg.OITopAPIURL != "" {
-		pool.SetOITopAPI(cfg.OITopAPIURL)
-		log.Printf("✓ 已配置OI Top API")
-	}
+	pool.SetOITopAPI(cfg.OITopAPIURL)
 
 	// 创建TraderManager
 	traderManager := manager.NewTraderManager()

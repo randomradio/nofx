@@ -76,7 +76,7 @@
     "HYPEUSDT"
   ],
   "coin_pool_api_url": "",
-  "oi_top_api_url": "",
+  "oi_top_api_url": "binance",
   "api_server_port": 8080,
   "max_daily_loss": 10.0,
   "max_drawdown": 20.0,

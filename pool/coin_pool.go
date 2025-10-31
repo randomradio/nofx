@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -75,7 +77,31 @@ func SetCoinPoolAPI(apiURL string) {
 
 // SetOITopAPI 设置OI Top API
 func SetOITopAPI(apiURL string) {
-	oiTopConfig.APIURL = apiURL
+	trimmed := strings.TrimSpace(apiURL)
+	if trimmed == "" || strings.EqualFold(trimmed, "binance") {
+		oiTopConfig.APIURL = defaultBinanceOpenInterestURL
+		oiTopConfig.Provider = "binance"
+		log.Printf("✓ 已启用币安官方持仓量API: %s", oiTopConfig.APIURL)
+		return
+	}
+
+	if strings.EqualFold(trimmed, "none") || strings.EqualFold(trimmed, "disable") || strings.EqualFold(trimmed, "disabled") {
+		oiTopConfig.APIURL = ""
+		oiTopConfig.Provider = "disabled"
+		log.Printf("⚠️  已禁用OI Top数据源")
+		return
+	}
+
+	if strings.Contains(strings.ToLower(trimmed), "binance.com") {
+		oiTopConfig.APIURL = trimmed
+		oiTopConfig.Provider = "binance"
+		log.Printf("✓ 已启用币安官方持仓量API: %s", oiTopConfig.APIURL)
+		return
+	}
+
+	oiTopConfig.APIURL = trimmed
+	oiTopConfig.Provider = "custom"
+	log.Printf("✓ 已配置自定义OI Top API: %s", oiTopConfig.APIURL)
 }
 
 // SetUseDefaultCoins 设置是否使用默认主流币种
@@ -408,23 +434,33 @@ type OITopCache struct {
 	SourceType string       `json:"source_type"`
 }
 
+const defaultBinanceOpenInterestURL = "https://fapi.binance.com/fapi/v1/openInterest"
+
 var oiTopConfig = struct {
 	APIURL   string
 	Timeout  time.Duration
 	CacheDir string
+	Provider string
 }{
-	APIURL:   "",
+	APIURL:   defaultBinanceOpenInterestURL,
 	Timeout:  30 * time.Second,
 	CacheDir: "coin_pool_cache",
+	Provider: "binance",
 }
 
 // GetOITopPositions 获取持仓量增长Top20数据（带重试和缓存）
 func GetOITopPositions() ([]OIPosition, error) {
-	// 检查API URL是否配置
-	if strings.TrimSpace(oiTopConfig.APIURL) == "" {
-		log.Printf("⚠️  未配置OI Top API URL，跳过OI Top数据获取")
-		return []OIPosition{}, nil // 返回空列表，不是错误
+	if oiTopConfig.Provider == "disabled" {
+		log.Printf("⚠️  已禁用OI Top数据源，跳过持仓量数据获取")
+		return []OIPosition{}, nil
 	}
+
+	providerLabel := "币安官方API"
+	if oiTopConfig.Provider == "custom" {
+		providerLabel = "自定义OI Top API"
+	}
+
+	log.Printf("🔍 正在使用%s获取持仓量数据...", providerLabel)
 
 	maxRetries := 3
 	var lastErr error
@@ -467,6 +503,14 @@ func GetOITopPositions() ([]OIPosition, error) {
 
 // fetchOITop 实际执行OI Top请求
 func fetchOITop() ([]OIPosition, error) {
+	if oiTopConfig.Provider == "custom" {
+		return fetchOITopFromCustomAPI()
+	}
+	return fetchOITopFromBinance()
+}
+
+// fetchOITopFromCustomAPI 调用自定义OI Top接口
+func fetchOITopFromCustomAPI() ([]OIPosition, error) {
 	log.Printf("🔄 正在请求OI Top数据...")
 
 	client := &http.Client{
@@ -507,6 +551,143 @@ func fetchOITop() ([]OIPosition, error) {
 	return response.Data.Positions, nil
 }
 
+// fetchOITopFromBinance 使用币安开放API获取持仓量数据
+func fetchOITopFromBinance() ([]OIPosition, error) {
+	log.Printf("🔄 正在从币安官方API获取持仓量数据...")
+
+	coins, err := GetCoinPool()
+	if err != nil {
+		log.Printf("⚠️  获取币种池失败，使用默认币种列表: %v", err)
+		coins = convertSymbolsToCoins(defaultMainstreamCoins)
+	}
+
+	symbolSet := make(map[string]struct{})
+	for _, coin := range coins {
+		symbol := normalizeSymbol(coin.Pair)
+		symbolSet[symbol] = struct{}{}
+	}
+	// 确保默认币种始终被包含
+	for _, symbol := range defaultMainstreamCoins {
+		symbolSet[normalizeSymbol(symbol)] = struct{}{}
+	}
+
+	const maxSymbols = 40
+	symbols := make([]string, 0, len(symbolSet))
+	for symbol := range symbolSet {
+		symbols = append(symbols, symbol)
+	}
+	sort.Strings(symbols)
+	if len(symbols) > maxSymbols {
+		symbols = symbols[:maxSymbols]
+	}
+
+	if len(symbols) == 0 {
+		return nil, fmt.Errorf("没有可用于获取持仓量的币种")
+	}
+
+	prevPositions, _ := loadOITopCache()
+	prevMap := make(map[string]OIPosition, len(prevPositions))
+	for _, pos := range prevPositions {
+		prevMap[strings.ToUpper(pos.Symbol)] = pos
+	}
+
+	client := &http.Client{
+		Timeout: oiTopConfig.Timeout,
+	}
+
+	var positions []OIPosition
+	for _, symbol := range symbols {
+		currentOI, err := fetchBinanceOpenInterest(client, oiTopConfig.APIURL, symbol)
+		if err != nil {
+			log.Printf("⚠️  获取%s持仓量失败: %v", symbol, err)
+			continue
+		}
+
+		position := OIPosition{
+			Symbol:    symbol,
+			CurrentOI: currentOI,
+		}
+
+		if prev, ok := prevMap[symbol]; ok {
+			position.OIDelta = currentOI - prev.CurrentOI
+			if prev.CurrentOI != 0 {
+				position.OIDeltaPercent = (position.OIDelta / prev.CurrentOI) * 100
+			}
+			position.OIDeltaValue = position.OIDelta
+			position.PriceDeltaPercent = prev.PriceDeltaPercent
+			position.NetLong = prev.NetLong
+			position.NetShort = prev.NetShort
+		} else {
+			position.OIDelta = 0
+			position.OIDeltaPercent = 0
+			position.OIDeltaValue = 0
+		}
+
+		positions = append(positions, position)
+	}
+
+	if len(positions) == 0 {
+		return nil, fmt.Errorf("未能从币安获取任何持仓量数据")
+	}
+
+	sort.Slice(positions, func(i, j int) bool {
+		if positions[i].OIDeltaPercent == positions[j].OIDeltaPercent {
+			return positions[i].CurrentOI > positions[j].CurrentOI
+		}
+		return positions[i].OIDeltaPercent > positions[j].OIDeltaPercent
+	})
+
+	if len(positions) > 20 {
+		positions = positions[:20]
+	}
+
+	for i := range positions {
+		positions[i].Rank = i + 1
+	}
+
+	return positions, nil
+}
+
+func fetchBinanceOpenInterest(client *http.Client, baseURL, symbol string) (float64, error) {
+	url := baseURL
+	if strings.Contains(baseURL, "?") {
+		url = fmt.Sprintf("%s&symbol=%s", baseURL, symbol)
+	} else {
+		url = fmt.Sprintf("%s?symbol=%s", baseURL, symbol)
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("请求币安持仓量失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("读取币安持仓量响应失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("币安持仓量API返回错误 (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var payload struct {
+		Symbol       string `json:"symbol"`
+		OpenInterest string `json:"openInterest"`
+		Time         int64  `json:"time"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, fmt.Errorf("解析币安持仓量JSON失败: %w", err)
+	}
+
+	openInterest, err := strconv.ParseFloat(payload.OpenInterest, 64)
+	if err != nil {
+		return 0, fmt.Errorf("解析币安持仓量数值失败: %w", err)
+	}
+
+	return openInterest, nil
+}
+
 // saveOITopCache 保存OI Top数据到缓存
 func saveOITopCache(positions []OIPosition) error {
 	if err := os.MkdirAll(oiTopConfig.CacheDir, 0755); err != nil {
@@ -516,7 +697,10 @@ func saveOITopCache(positions []OIPosition) error {
 	cache := OITopCache{
 		Positions:  positions,
 		FetchedAt:  time.Now(),
-		SourceType: "api",
+		SourceType: oiTopConfig.Provider,
+	}
+	if cache.SourceType == "" {
+		cache.SourceType = "unknown"
 	}
 
 	data, err := json.MarshalIndent(cache, "", "  ")
