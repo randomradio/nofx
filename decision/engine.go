@@ -106,6 +106,8 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 		return nil, fmt.Errorf("调用AI API失败: %w", err)
 	}
 
+	fmt.Printf("ai response: %s", aiResponse)
+
 	// 4. 解析AI响应
 	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
 	if err != nil {
@@ -292,13 +294,16 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 
 	// === 输出格式 ===
 	sb.WriteString("# 📤 输出格式\n\n")
-	sb.WriteString("**第一步: 思维链（纯文本）**\n")
-	sb.WriteString("简洁分析你的思考过程\n\n")
-	sb.WriteString("**第二步: JSON决策数组**\n\n")
+	// 先输出JSON，避免长思维链导致截断
+	sb.WriteString("**第一步: JSON决策数组（必须）**\n")
+	sb.WriteString("- 只输出一个 `json` 代码块\n")
+	sb.WriteString("- 即使没有可执行动作，也必须输出空数组 `[]`\n\n")
 	sb.WriteString("```json\n[\n")
 	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"下跌趋势+MACD死叉\"},\n", btcEthLeverage, accountEquity*5))
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"close_long\", \"reasoning\": \"止盈离场\"}\n")
 	sb.WriteString("]\n```\n\n")
+	sb.WriteString("**第二步: 思维链（不超过200字）**\n")
+	sb.WriteString("简洁说明你的判断依据、关键信号和风险控制\n\n")
 	sb.WriteString("**字段说明**:\n")
 	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString("- `confidence`: 0-100（开仓建议≥75）\n")
@@ -420,7 +425,7 @@ func buildUserPrompt(ctx *Context) string {
 func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
-	fmt.Printf("ai response: %s, \n CoT: %s", aiResponse)
+	fmt.Printf("ai response: %s, \n CoT: %s", aiResponse, cotTrace)
 
 	// 2. 提取JSON决策列表
 	decisions, err := extractDecisions(aiResponse)
@@ -447,46 +452,75 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 
 // extractCoTTrace 提取思维链分析
 func extractCoTTrace(response string) string {
-	// 查找JSON数组的开始位置
-	jsonStart := strings.Index(response, "[")
+	// 优先识别 ```json 代码块
+	blockStart, blockEnd, _ := findFirstCodeFence(response)
+	if blockStart >= 0 && blockEnd > blockStart {
+		// 优先使用代码块之后的文本作为思维链（我们要求先输出JSON）
+		after := strings.TrimSpace(response[blockEnd:])
+		if after != "" {
+			return after
+		}
+		before := strings.TrimSpace(response[:blockStart])
+		if before != "" {
+			return before
+		}
+	}
 
+	// 退化策略：按照第一个 '[' 分割
+	jsonStart := strings.Index(response, "[")
 	if jsonStart > 0 {
-		// 思维链是JSON数组之前的内容
 		return strings.TrimSpace(response[:jsonStart])
 	}
 
-	// 如果找不到JSON，整个响应都是思维链
 	return strings.TrimSpace(response)
 }
 
 // extractDecisions 提取JSON决策列表
 func extractDecisions(response string) ([]Decision, error) {
-	// 直接查找JSON数组 - 找第一个完整的JSON数组
+	// 1) 优先从 ```json 代码块中提取
+	if start, end, lang := findFirstCodeFence(response); start >= 0 && end > start {
+		content := response[start:end]
+		// 仅当包含 '[' 时尝试解析
+		if strings.Contains(content, "[") {
+			if decisions, err := parseDecisionsFromJSONFragment(content); err == nil {
+				return decisions, nil
+			} else {
+				// 如果标注为 json，但解析失败，继续走退化策略
+				_ = lang
+			}
+		}
+	}
+
+	// 2) 退化策略：在整个响应中寻找第一个完整的 JSON 数组
 	arrayStart := strings.Index(response, "[")
 	if arrayStart == -1 {
 		return nil, fmt.Errorf("无法找到JSON数组起始")
 	}
-
-	// 从 [ 开始，匹配括号找到对应的 ]
 	arrayEnd := findMatchingBracket(response, arrayStart)
 	if arrayEnd == -1 {
 		return nil, fmt.Errorf("无法找到JSON数组结束")
 	}
+	fragment := strings.TrimSpace(response[arrayStart : arrayEnd+1])
+	return parseDecisionsFromJSONFragment(fragment)
+}
 
-	jsonContent := strings.TrimSpace(response[arrayStart : arrayEnd+1])
-
-	// 🔧 修复常见的JSON格式错误：缺少引号的字段值
-	// 匹配: "reasoning": 内容"}  或  "reasoning": 内容}  (没有引号)
-	// 修复为: "reasoning": "内容"}
-	// 使用简单的字符串扫描而不是正则表达式
+// parseDecisionsFromJSONFragment 解析一段包含 JSON 数组的片段
+func parseDecisionsFromJSONFragment(fragment string) ([]Decision, error) {
+	// 在片段内再次定位第一个数组，避免头部有多余字符
+	start := strings.Index(fragment, "[")
+	if start == -1 {
+		return nil, fmt.Errorf("无法找到JSON数组起始")
+	}
+	end := findMatchingBracket(fragment, start)
+	if end == -1 {
+		return nil, fmt.Errorf("无法找到JSON数组结束")
+	}
+	jsonContent := strings.TrimSpace(fragment[start : end+1])
 	jsonContent = fixMissingQuotes(jsonContent)
-
-	// 解析JSON
 	var decisions []Decision
 	if err := json.Unmarshal([]byte(jsonContent), &decisions); err != nil {
 		return nil, fmt.Errorf("JSON解析失败: %w\nJSON内容: %s", err, jsonContent)
 	}
-
 	return decisions, nil
 }
 
@@ -529,6 +563,32 @@ func findMatchingBracket(s string, start int) int {
 	}
 
 	return -1
+}
+
+// findFirstCodeFence 查找第一个三反引号代码块，返回内容区间 [start, end) 及语言标记
+func findFirstCodeFence(s string) (int, int, string) {
+	fence := "```"
+	i := strings.Index(s, fence)
+	if i == -1 {
+		return -1, -1, ""
+	}
+
+	// 读取语言标记（直到行末）
+	rest := s[i+len(fence):]
+	nl := strings.IndexByte(rest, '\n')
+	if nl == -1 {
+		return -1, -1, ""
+	}
+	lang := strings.TrimSpace(strings.ToLower(rest[:nl]))
+	contentStart := i + len(fence) + nl + 1
+
+	// 查找结束围栏
+	j := strings.Index(s[contentStart:], fence)
+	if j == -1 {
+		return -1, -1, lang
+	}
+	contentEnd := contentStart + j
+	return contentStart, contentEnd, lang
 }
 
 // validateDecision 验证单个决策的有效性
