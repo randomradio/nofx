@@ -754,6 +754,31 @@ function DecisionCard({ decision, language }: { decision: DecisionRecord; langua
               {action.price > 0 && (
                 <span className="font-mono text-xs" style={{ color: '#848E9C' }}>@{action.price.toFixed(4)}</span>
               )}
+              {action.source === 'auto_trigger' && (
+                <span
+                  className="px-2 py-0.5 rounded text-xs font-semibold"
+                  style={{ background: 'rgba(236, 72, 153, 0.15)', color: '#EC4899' }}
+                >
+                  AUTO
+                </span>
+              )}
+              {action.trigger_reason && (
+                <span
+                  className="px-2 py-0.5 rounded text-xs font-semibold"
+                  style={action.trigger_reason === 'STOP_LOSS'
+                    ? { background: 'rgba(248, 113, 113, 0.2)', color: '#F87171' }
+                    : action.trigger_reason === 'TAKE_PROFIT'
+                      ? { background: 'rgba(16, 185, 129, 0.2)', color: '#10B981' }
+                      : { background: 'rgba(148, 163, 184, 0.2)', color: '#94A3B8' }
+                  }
+                >
+                  {action.trigger_reason === 'STOP_LOSS'
+                    ? t('stopLoss', language)
+                    : action.trigger_reason === 'TAKE_PROFIT'
+                      ? t('takeProfit', language)
+                      : action.trigger_reason}
+                </span>
+              )}
               <span style={{ color: action.success ? '#0ECB81' : '#F6465D' }}>
                 {action.success ? '✓' : '✗'}
               </span>

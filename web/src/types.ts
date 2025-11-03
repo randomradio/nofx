@@ -53,6 +53,8 @@ export interface DecisionAction {
   error?: string;
   commission?: number;
   commission_asset?: string;
+  source?: string;
+  trigger_reason?: string;
 }
 
 export interface AccountSnapshot {

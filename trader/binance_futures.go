@@ -483,6 +483,67 @@ func (t *FuturesTrader) GetRecentCommissions(symbol string, since time.Time) ([]
 	return entries, nil
 }
 
+// GetRecentFills 获取近期成交记录（用于捕获触发平仓的成交价格）
+func (t *FuturesTrader) GetRecentFills(symbol string, since time.Time) ([]TradeFill, error) {
+	start := since.Add(-1 * time.Minute)
+	if start.After(time.Now()) {
+		start = time.Now().Add(-1 * time.Minute)
+	}
+
+	service := t.client.NewListUserTradesService().
+		Symbol(symbol).
+		Limit(100)
+
+	if !since.IsZero() {
+		service = service.StartTime(start.UnixMilli())
+	}
+
+	trades, err := service.Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("获取成交历史失败: %w", err)
+	}
+
+	fills := make([]TradeFill, 0, len(trades))
+	for _, tr := range trades {
+		price, err := strconv.ParseFloat(tr.Price, 64)
+		if err != nil {
+			log.Printf("  ⚠️ 解析成交价格失败: %v", err)
+			continue
+		}
+
+		qty, err := strconv.ParseFloat(tr.Qty, 64)
+		if err != nil {
+			log.Printf("  ⚠️ 解析成交数量失败: %v", err)
+			continue
+		}
+
+		commission, err := strconv.ParseFloat(tr.Commission, 64)
+		if err != nil {
+			log.Printf("  ⚠️ 解析手续费失败: %v", err)
+			commission = 0
+		}
+
+		realizedPnL, err := strconv.ParseFloat(tr.RealizedPnl, 64)
+		if err != nil {
+			realizedPnL = 0
+		}
+
+		fills = append(fills, TradeFill{
+			OrderID:         tr.OrderID,
+			Price:           price,
+			Quantity:        qty,
+			Commission:      commission,
+			CommissionAsset: tr.CommissionAsset,
+			Time:            time.UnixMilli(tr.Time),
+			Side:            tr.Side,
+			PositionSide:    tr.PositionSide,
+			RealizedPnL:     realizedPnL,
+		})
+	}
+
+	return fills, nil
+}
+
 // CancelAllOrders 取消该币种的所有挂单
 func (t *FuturesTrader) CancelAllOrders(symbol string) error {
 	err := t.client.NewCancelAllOpenOrdersService().

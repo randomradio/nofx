@@ -107,6 +107,7 @@ export const translations = {
     fees: 'Fees',
     grossPnL: 'Gross P&L',
     stopLoss: 'Stop Loss',
+    takeProfit: 'Take Profit',
     latest: 'Latest',
 
     // AI Learning Description
@@ -227,6 +228,7 @@ export const translations = {
     fees: '手续费',
     grossPnL: '总盈亏（未扣费）',
     stopLoss: '止损',
+    takeProfit: '止盈',
     latest: '最新',
 
     // AI Learning Description

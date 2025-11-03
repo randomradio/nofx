@@ -22,6 +22,7 @@ interface TradeOutcome {
   open_time: string;
   close_time: string;
   was_stop_loss: boolean;
+  trigger_reason?: string;
 }
 
 interface SymbolPerformance {
@@ -634,6 +635,22 @@ export default function AILearning({ traderId }: AILearningProps) {
                           color: '#FCA5A5'
                         }}>
                           {t('stopLoss', language)}
+                        </span>
+                      )}
+                      {!trade.was_stop_loss && trade.trigger_reason === 'TAKE_PROFIT' && (
+                        <span className="px-2 py-0.5 rounded font-semibold" style={{
+                          background: 'rgba(16, 185, 129, 0.2)',
+                          color: '#34D399'
+                        }}>
+                          {t('takeProfit', language)}
+                        </span>
+                      )}
+                      {!trade.was_stop_loss && trade.trigger_reason && trade.trigger_reason !== 'TAKE_PROFIT' && (
+                        <span className="px-2 py-0.5 rounded font-semibold" style={{
+                          background: 'rgba(148, 163, 184, 0.2)',
+                          color: '#CBD5E1'
+                        }}>
+                          {trade.trigger_reason}
                         </span>
                       )}
                     </div>

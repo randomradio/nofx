@@ -66,6 +66,26 @@ type AutoTraderConfig struct {
 	StopTradingTime time.Duration // 触发风控后暂停时长
 }
 
+type trackedPosition struct {
+	Symbol          string
+	Side            string
+	Quantity        float64
+	EntryPrice      float64
+	Leverage        int
+	StopLoss        float64
+	TakeProfit      float64
+	OpenedAt        time.Time
+	LastSeen        time.Time
+	LastMarkPrice   float64
+	CommissionAsset string
+	Managed         bool
+}
+
+const (
+	actionSourceAIDecision  = "ai_decision"
+	actionSourceAutoTrigger = "auto_trigger"
+)
+
 // AutoTrader 自动交易器
 type AutoTrader struct {
 	id                         string // Trader唯一标识
@@ -85,6 +105,7 @@ type AutoTrader struct {
 	callCount                  int                // AI调用次数
 	positionFirstSeenTime      map[string]int64   // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
 	processedCommissionTranIDs map[int64]struct{} // 已处理的手续费记录（避免重复计算）
+	openPositions              map[string]*trackedPosition
 }
 
 // NewAutoTrader 创建自动交易器
@@ -180,6 +201,7 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		isRunning:                  false,
 		positionFirstSeenTime:      make(map[string]int64),
 		processedCommissionTranIDs: make(map[int64]struct{}),
+		openPositions:              make(map[string]*trackedPosition),
 	}, nil
 }
 
@@ -280,6 +302,8 @@ func (at *AutoTrader) runCycle() error {
 		})
 	}
 
+	at.reconcileAutoClosedPositions(ctx.Positions, record)
+
 	// 保存候选币种列表
 	for _, coin := range ctx.CandidateCoins {
 		record.CandidateCoins = append(record.CandidateCoins, coin.Symbol)
@@ -357,6 +381,7 @@ func (at *AutoTrader) runCycle() error {
 			Price:     0,
 			Timestamp: time.Now(),
 			Success:   false,
+			Source:    actionSourceAIDecision,
 		}
 
 		if err := at.executeDecisionWithRecord(&d, &actionRecord); err != nil {
@@ -626,6 +651,289 @@ func (at *AutoTrader) captureCommission(symbol string, placedAt time.Time) (floa
 	return total, asset
 }
 
+func positionMapKey(symbol, side string) string {
+	return symbol + "_" + side
+}
+
+func (at *AutoTrader) trackPositionOpened(decision *decision.Decision, actionRecord *logger.DecisionAction, side string) {
+	if decision == nil || actionRecord == nil {
+		return
+	}
+
+	quantity := actionRecord.Quantity
+	if quantity <= 0 && actionRecord.Price > 0 && decision.PositionSizeUSD > 0 {
+		quantity = decision.PositionSizeUSD / actionRecord.Price
+	}
+
+	if quantity <= 0 {
+		return
+	}
+
+	at.openPositions[positionMapKey(decision.Symbol, side)] = &trackedPosition{
+		Symbol:          decision.Symbol,
+		Side:            side,
+		Quantity:        quantity,
+		EntryPrice:      actionRecord.Price,
+		Leverage:        decision.Leverage,
+		StopLoss:        decision.StopLoss,
+		TakeProfit:      decision.TakeProfit,
+		OpenedAt:        actionRecord.Timestamp,
+		LastSeen:        time.Now(),
+		LastMarkPrice:   actionRecord.Price,
+		CommissionAsset: actionRecord.CommissionAsset,
+		Managed:         true,
+	}
+}
+
+func (at *AutoTrader) trackPositionClosed(symbol, side string) {
+	delete(at.openPositions, positionMapKey(symbol, side))
+}
+
+func (at *AutoTrader) reconcileAutoClosedPositions(current []decision.PositionInfo, record *logger.DecisionRecord) {
+	currentKeys := make(map[string]struct{})
+
+	for _, pos := range current {
+		key := positionMapKey(pos.Symbol, pos.Side)
+		currentKeys[key] = struct{}{}
+
+		if tracked, ok := at.openPositions[key]; ok {
+			tracked.Quantity = pos.Quantity
+			if pos.EntryPrice > 0 {
+				tracked.EntryPrice = pos.EntryPrice
+			}
+			if pos.Leverage > 0 {
+				tracked.Leverage = pos.Leverage
+			}
+			tracked.LastMarkPrice = pos.MarkPrice
+			tracked.LastSeen = time.Now()
+		} else {
+			at.openPositions[key] = &trackedPosition{
+				Symbol:        pos.Symbol,
+				Side:          pos.Side,
+				Quantity:      pos.Quantity,
+				EntryPrice:    pos.EntryPrice,
+				Leverage:      pos.Leverage,
+				LastSeen:      time.Now(),
+				LastMarkPrice: pos.MarkPrice,
+				Managed:       false,
+			}
+		}
+	}
+
+	for key, tracked := range at.openPositions {
+		if _, stillOpen := currentKeys[key]; stillOpen {
+			continue
+		}
+
+		if !tracked.Managed {
+			delete(at.openPositions, key)
+			continue
+		}
+
+		at.recordAutoClose(tracked, record)
+		delete(at.openPositions, key)
+	}
+}
+
+func (at *AutoTrader) recordAutoClose(pos *trackedPosition, record *logger.DecisionRecord) {
+	if record == nil || pos == nil {
+		return
+	}
+
+	action := at.buildAutoCloseAction(pos)
+	record.Decisions = append(record.Decisions, action)
+
+	reason := action.TriggerReason
+	if reason == "" {
+		reason = logger.TriggerReasonUnknown
+	}
+
+	priceStr := "-"
+	if action.Price > 0 {
+		priceStr = fmt.Sprintf("%.4f", action.Price)
+	}
+
+	record.ExecutionLog = append(record.ExecutionLog,
+		fmt.Sprintf("⚠ %s %s 自动触发平仓（%s）@ %s",
+			pos.Symbol,
+			strings.ToUpper(pos.Side),
+			reason,
+			priceStr,
+		))
+}
+
+func (at *AutoTrader) buildAutoCloseAction(pos *trackedPosition) logger.DecisionAction {
+	side := strings.ToLower(pos.Side)
+	actionName := "close_long"
+	if side == "short" {
+		actionName = "close_short"
+	}
+
+	fill := at.lookupAutoCloseFill(pos)
+
+	price := pos.LastMarkPrice
+	quantity := pos.Quantity
+	timestamp := time.Now()
+	commission := 0.0
+	commissionAsset := pos.CommissionAsset
+	orderID := int64(0)
+
+	if fill != nil {
+		if fill.Quantity > 0 {
+			quantity = fill.Quantity
+		}
+		if fill.Price > 0 {
+			price = fill.Price
+		}
+		if fill.Commission != 0 {
+			commission = math.Abs(fill.Commission)
+		}
+		if fill.CommissionAsset != "" {
+			commissionAsset = fill.CommissionAsset
+		}
+		if !fill.Time.IsZero() {
+			timestamp = fill.Time
+		}
+		if fill.OrderID != 0 {
+			orderID = fill.OrderID
+		}
+	}
+
+	if price <= 0 {
+		if marketData, err := market.Get(pos.Symbol); err == nil {
+			price = marketData.CurrentPrice
+		}
+	}
+
+	reason := at.inferTriggerReason(pos, price)
+
+	return logger.DecisionAction{
+		Action:          actionName,
+		Symbol:          pos.Symbol,
+		Quantity:        quantity,
+		Leverage:        pos.Leverage,
+		Price:           price,
+		OrderID:         orderID,
+		Timestamp:       timestamp,
+		Success:         true,
+		Commission:      commission,
+		CommissionAsset: commissionAsset,
+		Source:          actionSourceAutoTrigger,
+		TriggerReason:   reason,
+	}
+}
+
+func (at *AutoTrader) lookupAutoCloseFill(pos *trackedPosition) *TradeFill {
+	provider, ok := at.trader.(TradeHistoryProvider)
+	if !ok || pos == nil {
+		return nil
+	}
+
+	since := pos.OpenedAt
+	if since.IsZero() {
+		since = time.Now().Add(-6 * time.Hour)
+	}
+
+	fills, err := provider.GetRecentFills(pos.Symbol, since)
+	if err != nil {
+		log.Printf("  ⚠ 获取成交历史以识别触发平仓失败: %v", err)
+		return nil
+	}
+
+	if len(fills) == 0 {
+		return nil
+	}
+
+	desiredSide := "SELL"
+	if strings.EqualFold(pos.Side, "short") {
+		desiredSide = "BUY"
+	}
+
+	var (
+		totalQty        float64
+		weightedPrice   float64
+		totalCommission float64
+		lastTime        time.Time
+		commissionAsset string
+		orderID         int64
+	)
+
+	for _, fill := range fills {
+		if !strings.EqualFold(fill.PositionSide, pos.Side) {
+			continue
+		}
+		if !strings.EqualFold(fill.Side, desiredSide) {
+			continue
+		}
+		if fill.Quantity <= 0 {
+			continue
+		}
+
+		totalQty += fill.Quantity
+		weightedPrice += fill.Price * fill.Quantity
+		totalCommission += math.Abs(fill.Commission)
+		if commissionAsset == "" {
+			commissionAsset = fill.CommissionAsset
+		}
+		if fill.Time.After(lastTime) {
+			lastTime = fill.Time
+		}
+		if orderID == 0 && fill.OrderID != 0 {
+			orderID = fill.OrderID
+		}
+	}
+
+	if totalQty == 0 {
+		return nil
+	}
+
+	avgPrice := weightedPrice / totalQty
+	return &TradeFill{
+		OrderID:         orderID,
+		Price:           avgPrice,
+		Quantity:        totalQty,
+		Commission:      totalCommission,
+		CommissionAsset: commissionAsset,
+		Time:            lastTime,
+	}
+}
+
+func (at *AutoTrader) inferTriggerReason(pos *trackedPosition, closePrice float64) string {
+	if pos == nil || closePrice <= 0 {
+		return logger.TriggerReasonUnknown
+	}
+
+	const tolerance = 0.005 // 0.5% 容差，考虑滑点
+
+	if pos.TakeProfit > 0 {
+		switch strings.ToLower(pos.Side) {
+		case "long":
+			if closePrice >= pos.TakeProfit*(1-tolerance) {
+				return logger.TriggerReasonTakeProfit
+			}
+		case "short":
+			if closePrice <= pos.TakeProfit*(1+tolerance) {
+				return logger.TriggerReasonTakeProfit
+			}
+		}
+	}
+
+	if pos.StopLoss > 0 {
+		switch strings.ToLower(pos.Side) {
+		case "long":
+			if closePrice <= pos.StopLoss*(1+tolerance) {
+				return logger.TriggerReasonStopLoss
+			}
+		case "short":
+			if closePrice >= pos.StopLoss*(1-tolerance) {
+				return logger.TriggerReasonStopLoss
+			}
+		}
+	}
+
+	return logger.TriggerReasonUnknown
+}
+
 // adjustPositionSize 根据可用保证金调整仓位大小，避免触发保证金不足错误
 func (at *AutoTrader) adjustPositionSize(symbol string, desiredUSD float64, leverage int) (float64, float64, error) {
 	if desiredUSD <= 0 {
@@ -747,6 +1055,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
 	}
 
+	actionRecord.Timestamp = time.Now()
+	at.trackPositionOpened(decision, actionRecord, "long")
+
 	return nil
 }
 
@@ -830,6 +1141,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
 	}
 
+	actionRecord.Timestamp = time.Now()
+	at.trackPositionOpened(decision, actionRecord, "short")
+
 	return nil
 }
 
@@ -854,6 +1168,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 			if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
 				log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
 			}
+			at.trackPositionClosed(decision.Symbol, "long")
 			return nil
 		}
 		return err
@@ -884,6 +1199,8 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	log.Printf("  ✓ 平仓成功")
+	actionRecord.Timestamp = time.Now()
+	at.trackPositionClosed(decision.Symbol, "long")
 	return nil
 }
 
@@ -908,6 +1225,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 			if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
 				log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
 			}
+			at.trackPositionClosed(decision.Symbol, "short")
 			return nil
 		}
 		return err
@@ -938,6 +1256,8 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	log.Printf("  ✓ 平仓成功")
+	actionRecord.Timestamp = time.Now()
+	at.trackPositionClosed(decision.Symbol, "short")
 	return nil
 }
 

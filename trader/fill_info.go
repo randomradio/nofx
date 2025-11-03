@@ -27,3 +27,21 @@ type CommissionEntry struct {
 type CommissionHistoryProvider interface {
 	GetRecentCommissions(symbol string, since time.Time) ([]CommissionEntry, error)
 }
+
+// TradeFill captures an executed trade fill returned by an exchange.
+type TradeFill struct {
+	OrderID         int64
+	Price           float64
+	Quantity        float64
+	Commission      float64
+	CommissionAsset string
+	Time            time.Time
+	Side            string
+	PositionSide    string
+	RealizedPnL     float64
+}
+
+// TradeHistoryProvider exposes access to recent trade fills.
+type TradeHistoryProvider interface {
+	GetRecentFills(symbol string, since time.Time) ([]TradeFill, error)
+}

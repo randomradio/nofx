@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+const (
+	TriggerReasonStopLoss    = "STOP_LOSS"
+	TriggerReasonTakeProfit  = "TAKE_PROFIT"
+	TriggerReasonLiquidation = "LIQUIDATION"
+	TriggerReasonUnknown     = "UNKNOWN"
+)
+
 // DecisionRecord 决策记录
 type DecisionRecord struct {
 	Timestamp      time.Time          `json:"timestamp"`       // 决策时间
@@ -60,6 +67,8 @@ type DecisionAction struct {
 	Error           string    `json:"error"`            // 错误信息
 	Commission      float64   `json:"commission"`       // 手续费
 	CommissionAsset string    `json:"commission_asset"` // 手续费资产
+	Source          string    `json:"source,omitempty"` // 数据来源（ai_decision/auto_trigger等）
+	TriggerReason   string    `json:"trigger_reason,omitempty"`
 }
 
 // DecisionLogger 决策日志记录器
@@ -289,6 +298,7 @@ type TradeOutcome struct {
 	OpenTime      time.Time `json:"open_time"`      // 开仓时间
 	CloseTime     time.Time `json:"close_time"`     // 平仓时间
 	WasStopLoss   bool      `json:"was_stop_loss"`  // 是否止损
+	TriggerReason string    `json:"trigger_reason"` // 触发原因（止损/止盈/强平/未知）
 }
 
 // PerformanceAnalysis 交易表现分析
@@ -472,7 +482,9 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 						Duration:      action.Timestamp.Sub(openTime).String(),
 						OpenTime:      openTime,
 						CloseTime:     action.Timestamp,
+						TriggerReason: action.TriggerReason,
 					}
+					outcome.WasStopLoss = action.TriggerReason == TriggerReasonStopLoss
 
 					analysis.RecentTrades = append(analysis.RecentTrades, outcome)
 					analysis.TotalTrades++
