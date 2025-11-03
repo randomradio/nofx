@@ -485,17 +485,16 @@ func (t *FuturesTrader) GetRecentCommissions(symbol string, since time.Time) ([]
 
 // GetRecentFills 获取近期成交记录（用于捕获触发平仓的成交价格）
 func (t *FuturesTrader) GetRecentFills(symbol string, since time.Time) ([]TradeFill, error) {
-	start := since.Add(-1 * time.Minute)
-	if start.After(time.Now()) {
-		start = time.Now().Add(-1 * time.Minute)
-	}
-
-	service := t.client.NewListUserTradesService().
+	service := t.client.NewListAccountTradeService().
 		Symbol(symbol).
 		Limit(100)
 
 	if !since.IsZero() {
-		service = service.StartTime(start.UnixMilli())
+		start := since.Add(-2 * time.Minute).UnixMilli()
+		if start < 0 {
+			start = 0
+		}
+		service = service.StartTime(start)
 	}
 
 	trades, err := service.Do(context.Background())
@@ -511,7 +510,7 @@ func (t *FuturesTrader) GetRecentFills(symbol string, since time.Time) ([]TradeF
 			continue
 		}
 
-		qty, err := strconv.ParseFloat(tr.Qty, 64)
+		qty, err := strconv.ParseFloat(tr.Quantity, 64)
 		if err != nil {
 			log.Printf("  ⚠️ 解析成交数量失败: %v", err)
 			continue
@@ -535,8 +534,8 @@ func (t *FuturesTrader) GetRecentFills(symbol string, since time.Time) ([]TradeF
 			Commission:      commission,
 			CommissionAsset: tr.CommissionAsset,
 			Time:            time.UnixMilli(tr.Time),
-			Side:            tr.Side,
-			PositionSide:    tr.PositionSide,
+			Side:            string(tr.Side),
+			PositionSide:    string(tr.PositionSide),
 			RealizedPnL:     realizedPnL,
 		})
 	}
