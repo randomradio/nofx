@@ -99,21 +99,57 @@ func (s *Server) setupRoutes() {
 		api.Use(s.authMiddleware())
 	}
 	{
-		// 竞赛总览
-		api.GET("/competition", s.handleCompetition)
+		// 健康检查
+		api.Any("/health", s.handleHealth)
+		
+		// 认证相关路由（无需认证）
+		api.POST("/register", s.handleRegister)
+		api.POST("/login", s.handleLogin)
+		api.POST("/verify-otp", s.handleVerifyOTP)
+		api.POST("/complete-registration", s.handleCompleteRegistration)
+		
+		// 系统支持的模型和交易所（无需认证）
+		api.GET("/supported-models", s.handleGetSupportedModels)
+		api.GET("/supported-exchanges", s.handleGetSupportedExchanges)
+		
+		// 系统配置（无需认证）
+		api.GET("/config", s.handleGetSystemConfig)
+		
+		// 系统提示词模板管理（无需认证）
+		api.GET("/prompt-templates", s.handleGetPromptTemplates)
+		api.GET("/prompt-templates/:name", s.handleGetPromptTemplate)
+		
+		// 公开的竞赛数据（无需认证）
+		api.GET("/traders", s.handlePublicTraderList)
+		api.GET("/competition", s.handlePublicCompetition)
+		api.GET("/equity-history", s.handleEquityHistory)
 
 		// Trader列表
 		api.GET("/traders", s.handleTraderList)
 
-		// 指定trader的数据（使用query参数 ?trader_id=xxx）
-		api.GET("/status", s.handleStatus)
-		api.GET("/account", s.handleAccount)
-		api.GET("/positions", s.handlePositions)
-		api.GET("/decisions", s.handleDecisions)
-		api.GET("/decisions/latest", s.handleLatestDecisions)
-		api.GET("/statistics", s.handleStatistics)
-		api.GET("/equity-history", s.handleEquityHistory)
-		api.GET("/performance", s.handlePerformance)
+			// AI模型配置
+			protected.GET("/models", s.handleGetModelConfigs)
+			protected.PUT("/models", s.handleUpdateModelConfigs)
+
+			// 交易所配置
+			protected.GET("/exchanges", s.handleGetExchangeConfigs)
+			protected.PUT("/exchanges", s.handleUpdateExchangeConfigs)
+
+			// 用户信号源配置
+			protected.GET("/user/signal-sources", s.handleGetUserSignalSource)
+			protected.POST("/user/signal-sources", s.handleSaveUserSignalSource)
+
+
+			
+			// 指定trader的数据（使用query参数 ?trader_id=xxx）
+			protected.GET("/status", s.handleStatus)
+			protected.GET("/account", s.handleAccount)
+			protected.GET("/positions", s.handlePositions)
+			protected.GET("/decisions", s.handleDecisions)
+			protected.GET("/decisions/latest", s.handleLatestDecisions)
+			protected.GET("/statistics", s.handleStatistics)
+			protected.GET("/performance", s.handlePerformance)
+		}
 	}
 }
 
@@ -503,15 +539,24 @@ func (s *Server) Start() error {
 	addr := fmt.Sprintf(":%d", s.port)
 	log.Printf("🌐 API服务器启动在 http://localhost%s", addr)
 	log.Printf("📊 API文档:")
-	log.Printf("  • GET  /api/competition      - 竞赛总览（对比所有trader）")
-	log.Printf("  • GET  /api/traders          - Trader列表")
+	log.Printf("  • GET  /api/health           - 健康检查")
+	log.Printf("  • GET  /api/traders          - 公开的AI交易员列表（无需认证）")
+	log.Printf("  • GET  /api/competition      - 公开的竞赛数据（无需认证）")
+	log.Printf("  • GET  /api/equity-history?trader_id=xxx - 公开的收益率历史数据（无需认证，竞赛用）")
+	log.Printf("  • POST /api/traders          - 创建新的AI交易员")
+	log.Printf("  • DELETE /api/traders/:id    - 删除AI交易员")
+	log.Printf("  • POST /api/traders/:id/start - 启动AI交易员")
+	log.Printf("  • POST /api/traders/:id/stop  - 停止AI交易员")
+	log.Printf("  • GET  /api/models           - 获取AI模型配置")
+	log.Printf("  • PUT  /api/models           - 更新AI模型配置")
+	log.Printf("  • GET  /api/exchanges        - 获取交易所配置")
+	log.Printf("  • PUT  /api/exchanges        - 更新交易所配置")
 	log.Printf("  • GET  /api/status?trader_id=xxx     - 指定trader的系统状态")
 	log.Printf("  • GET  /api/account?trader_id=xxx    - 指定trader的账户信息")
 	log.Printf("  • GET  /api/positions?trader_id=xxx  - 指定trader的持仓列表")
 	log.Printf("  • GET  /api/decisions?trader_id=xxx  - 指定trader的决策日志")
 	log.Printf("  • GET  /api/decisions/latest?trader_id=xxx - 指定trader的最新决策")
 	log.Printf("  • GET  /api/statistics?trader_id=xxx - 指定trader的统计信息")
-	log.Printf("  • GET  /api/equity-history?trader_id=xxx - 指定trader的收益率历史数据")
 	log.Printf("  • GET  /api/performance?trader_id=xxx - 指定trader的AI学习表现分析")
 	log.Printf("  • GET  /health               - 健康检查")
 	log.Println()
@@ -605,3 +650,4 @@ func (s *Server) signToken(data []byte) []byte {
 	mac.Write(data)
 	return mac.Sum(nil)
 }
+
