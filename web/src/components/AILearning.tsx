@@ -14,6 +14,10 @@ interface TradeOutcome {
   margin_used: number;
   pn_l: number;
   pn_l_pct: number;
+  gross_pn_l?: number;
+  gross_pn_l_pct?: number;
+  fee?: number;
+  fee_asset?: string;
   duration: string;
   open_time: string;
   close_time: string;
@@ -504,6 +508,9 @@ export default function AILearning({ traderId }: AILearningProps) {
             {performance?.recent_trades && performance.recent_trades.length > 0 ? (
               performance.recent_trades.map((trade: TradeOutcome, idx: number) => {
                 const isProfitable = trade.pn_l >= 0;
+                const grossPnL = typeof trade.gross_pn_l === 'number' ? trade.gross_pn_l : null;
+                const feeAmount = typeof trade.fee === 'number' ? trade.fee : null;
+                const hasFee = feeAmount !== null && Math.abs(feeAmount) > 0.0001;
                 const isRecent = idx === 0;
 
                 return (
@@ -601,6 +608,22 @@ export default function AILearning({ traderId }: AILearningProps) {
                           {isProfitable ? '+' : ''}{trade.pn_l.toFixed(2)} USDT
                         </span>
                       </div>
+                      {hasFee && (
+                        <div className="flex items-center justify-between text-[11px] mt-1" style={{ color: '#94A3B8' }}>
+                          <span>{t('fees', language)}</span>
+                          <span className="font-mono" style={{ color: '#F59E0B' }}>
+                            -{Math.abs(feeAmount as number).toFixed(2)} {trade.fee_asset || 'USDT'}
+                          </span>
+                        </div>
+                      )}
+                      {grossPnL !== null && (
+                        <div className="flex items-center justify-between text-[11px] mt-1" style={{ color: '#94A3B8' }}>
+                          <span>{t('grossPnL', language)}</span>
+                          <span className="font-mono" style={{ color: grossPnL >= 0 ? '#10B981' : '#F87171' }}>
+                            {grossPnL >= 0 ? '+' : ''}{grossPnL.toFixed(2)} USDT
+                          </span>
+                        </div>
+                      )}
                     </div>
 
                     <div className="flex items-center justify-between text-xs" style={{ color: '#94A3B8' }}>

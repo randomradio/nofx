@@ -79,10 +79,10 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 
 // invalidatePositionsCache 使持仓缓存失效，下一次获取将强制走API
 func (t *FuturesTrader) invalidatePositionsCache() {
-    t.positionsCacheMutex.Lock()
-    t.cachedPositions = nil
-    t.positionsCacheTime = time.Time{}
-    t.positionsCacheMutex.Unlock()
+	t.positionsCacheMutex.Lock()
+	t.cachedPositions = nil
+	t.positionsCacheTime = time.Time{}
+	t.positionsCacheMutex.Unlock()
 }
 
 // GetPositions 获取所有持仓（带缓存）
@@ -304,8 +304,8 @@ func (t *FuturesTrader) OpenShort(symbol string, quantity float64, leverage int)
 
 // CloseLong 平多仓
 func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
-    // 关键：平仓前强制刷新一次持仓，避免命中缓存
-    t.invalidatePositionsCache()
+	// 关键：平仓前强制刷新一次持仓，避免命中缓存
+	t.invalidatePositionsCache()
 	// 如果数量为0，获取当前持仓数量
 	if quantity == 0 {
 		positions, err := t.GetPositions()
@@ -360,8 +360,8 @@ func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]i
 
 // CloseShort 平空仓
 func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
-    // 关键：平仓前强制刷新一次持仓，避免命中缓存
-    t.invalidatePositionsCache()
+	// 关键：平仓前强制刷新一次持仓，避免命中缓存
+	t.invalidatePositionsCache()
 	// 如果数量为0，获取当前持仓数量
 	if quantity == 0 {
 		positions, err := t.GetPositions()
@@ -412,6 +412,75 @@ func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]
 	result["symbol"] = order.Symbol
 	result["status"] = order.Status
 	return result, nil
+}
+
+// GetOrderFillInfo 查询指定订单的成交详情（包含实际数量、均价和手续费）
+func (t *FuturesTrader) GetOrderFillInfo(symbol string, orderID int64) (*OrderFillInfo, error) {
+	const maxAttempts = 5
+	const backoff = 200 * time.Millisecond
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		order, err := t.client.NewGetOrderService().
+			Symbol(symbol).
+			OrderID(orderID).
+			Do(context.Background())
+		if err != nil {
+			time.Sleep(backoff)
+			continue
+		}
+
+		executedQty, err := strconv.ParseFloat(order.ExecutedQuantity, 64)
+		if err != nil {
+			log.Printf("  ⚠️ 解析成交数量失败: %v", err)
+			executedQty = 0
+		}
+		avgPrice, err := strconv.ParseFloat(order.AvgPrice, 64)
+		if err != nil {
+			log.Printf("  ⚠️ 解析成交均价失败: %v", err)
+			avgPrice = 0
+		}
+
+		return &OrderFillInfo{
+			Quantity: executedQty,
+			AvgPrice: avgPrice,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("订单 %d 未找到成交记录", orderID)
+}
+
+// GetRecentCommissions 获取指定时间之后的手续费记录
+func (t *FuturesTrader) GetRecentCommissions(symbol string, since time.Time) ([]CommissionEntry, error) {
+	start := since.Add(-30 * time.Second).UnixMilli()
+
+	res, err := t.client.NewGetIncomeHistoryService().
+		Symbol(symbol).
+		IncomeType("COMMISSION").
+		StartTime(start).
+		Limit(50).
+		Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("获取手续费记录失败: %w", err)
+	}
+
+	var entries []CommissionEntry
+	for _, record := range res {
+		amount, err := strconv.ParseFloat(record.Income, 64)
+		if err != nil {
+			continue
+		}
+
+		entry := CommissionEntry{
+			TranID: record.TranID,
+			Asset:  record.Asset,
+			Amount: amount,
+			Time:   time.UnixMilli(record.Time),
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
 }
 
 // CancelAllOrders 取消该币种的所有挂单

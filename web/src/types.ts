@@ -51,6 +51,8 @@ export interface DecisionAction {
   timestamp: string;
   success: boolean;
   error?: string;
+  commission?: number;
+  commission_asset?: string;
 }
 
 export interface AccountSnapshot {

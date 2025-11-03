@@ -49,15 +49,17 @@ type PositionSnapshot struct {
 
 // DecisionAction 决策动作
 type DecisionAction struct {
-	Action    string    `json:"action"`    // open_long, open_short, close_long, close_short
-	Symbol    string    `json:"symbol"`    // 币种
-	Quantity  float64   `json:"quantity"`  // 数量
-	Leverage  int       `json:"leverage"`  // 杠杆（开仓时）
-	Price     float64   `json:"price"`     // 执行价格
-	OrderID   int64     `json:"order_id"`  // 订单ID
-	Timestamp time.Time `json:"timestamp"` // 执行时间
-	Success   bool      `json:"success"`   // 是否成功
-	Error     string    `json:"error"`     // 错误信息
+	Action          string    `json:"action"`           // open_long, open_short, close_long, close_short
+	Symbol          string    `json:"symbol"`           // 币种
+	Quantity        float64   `json:"quantity"`         // 数量
+	Leverage        int       `json:"leverage"`         // 杠杆（开仓时）
+	Price           float64   `json:"price"`            // 执行价格
+	OrderID         int64     `json:"order_id"`         // 订单ID
+	Timestamp       time.Time `json:"timestamp"`        // 执行时间
+	Success         bool      `json:"success"`          // 是否成功
+	Error           string    `json:"error"`            // 错误信息
+	Commission      float64   `json:"commission"`       // 手续费
+	CommissionAsset string    `json:"commission_asset"` // 手续费资产
 }
 
 // DecisionLogger 决策日志记录器
@@ -277,7 +279,11 @@ type TradeOutcome struct {
 	ClosePrice    float64   `json:"close_price"`    // 平仓价
 	PositionValue float64   `json:"position_value"` // 仓位价值（quantity × openPrice）
 	MarginUsed    float64   `json:"margin_used"`    // 保证金使用（positionValue / leverage）
+	GrossPnL      float64   `json:"gross_pn_l"`     // 扣除手续费前盈亏
 	PnL           float64   `json:"pn_l"`           // 盈亏（USDT）
+	Fee           float64   `json:"fee"`            // 手续费合计
+	FeeAsset      string    `json:"fee_asset"`      // 手续费资产
+	GrossPnLPct   float64   `json:"gross_pn_l_pct"` // 手续费前盈亏百分比
 	PnLPct        float64   `json:"pn_l_pct"`       // 盈亏百分比（相对保证金）
 	Duration      string    `json:"duration"`       // 持仓时长
 	OpenTime      time.Time `json:"open_time"`      // 开仓时间
@@ -358,11 +364,13 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 				case "open_long", "open_short":
 					// 记录开仓
 					openPositions[posKey] = map[string]interface{}{
-						"side":      side,
-						"openPrice": action.Price,
-						"openTime":  action.Timestamp,
-						"quantity":  action.Quantity,
-						"leverage":  action.Leverage,
+						"side":            side,
+						"openPrice":       action.Price,
+						"openTime":        action.Timestamp,
+						"quantity":        action.Quantity,
+						"leverage":        action.Leverage,
+						"commission":      action.Commission,
+						"commissionAsset": action.CommissionAsset,
 					}
 				case "close_long", "close_short":
 					// 移除已平仓记录
@@ -392,11 +400,13 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 			case "open_long", "open_short":
 				// 更新开仓记录（可能已经在预填充时记录过了）
 				openPositions[posKey] = map[string]interface{}{
-					"side":      side,
-					"openPrice": action.Price,
-					"openTime":  action.Timestamp,
-					"quantity":  action.Quantity,
-					"leverage":  action.Leverage,
+					"side":            side,
+					"openPrice":       action.Price,
+					"openTime":        action.Timestamp,
+					"quantity":        action.Quantity,
+					"leverage":        action.Leverage,
+					"commission":      action.Commission,
+					"commissionAsset": action.CommissionAsset,
 				}
 
 			case "close_long", "close_short":
@@ -406,24 +416,41 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 					openTime := openPos["openTime"].(time.Time)
 					side := openPos["side"].(string)
 					quantity := openPos["quantity"].(float64)
+					if quantity == 0 && action.Quantity > 0 {
+						quantity = action.Quantity
+					}
 					leverage := openPos["leverage"].(int)
+					openCommission := 0.0
+					if commission, ok := openPos["commission"].(float64); ok {
+						openCommission = commission
+					}
+					commissionAsset := action.CommissionAsset
+					if commissionAsset == "" {
+						if asset, ok := openPos["commissionAsset"].(string); ok {
+							commissionAsset = asset
+						}
+					}
 
 					// 计算实际盈亏（USDT）
 					// 合约交易 PnL 计算：quantity × 价格差
 					// 注意：杠杆不影响绝对盈亏，只影响保证金需求
-					var pnl float64
+					var grossPnL float64
 					if side == "long" {
-						pnl = quantity * (action.Price - openPrice)
+						grossPnL = quantity * (action.Price - openPrice)
 					} else {
-						pnl = quantity * (openPrice - action.Price)
+						grossPnL = quantity * (openPrice - action.Price)
 					}
+					totalFees := openCommission + action.Commission
+					netPnL := grossPnL - totalFees
 
 					// 计算盈亏百分比（相对保证金）
 					positionValue := quantity * openPrice
 					marginUsed := positionValue / float64(leverage)
-					pnlPct := 0.0
+					grossPnLPct := 0.0
+					netPnLPct := 0.0
 					if marginUsed > 0 {
-						pnlPct = (pnl / marginUsed) * 100
+						grossPnLPct = (grossPnL / marginUsed) * 100
+						netPnLPct = (netPnL / marginUsed) * 100
 					}
 
 					// 记录交易结果
@@ -436,8 +463,12 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 						ClosePrice:    action.Price,
 						PositionValue: positionValue,
 						MarginUsed:    marginUsed,
-						PnL:           pnl,
-						PnLPct:        pnlPct,
+						GrossPnL:      grossPnL,
+						PnL:           netPnL,
+						Fee:           totalFees,
+						FeeAsset:      commissionAsset,
+						GrossPnLPct:   grossPnLPct,
+						PnLPct:        netPnLPct,
 						Duration:      action.Timestamp.Sub(openTime).String(),
 						OpenTime:      openTime,
 						CloseTime:     action.Timestamp,
@@ -447,12 +478,12 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 					analysis.TotalTrades++
 
 					// 分类交易：盈利、亏损、持平（避免将pnl=0算入亏损）
-					if pnl > 0 {
+					if netPnL > 0 {
 						analysis.WinningTrades++
-						analysis.AvgWin += pnl
-					} else if pnl < 0 {
+						analysis.AvgWin += netPnL
+					} else if netPnL < 0 {
 						analysis.LosingTrades++
-						analysis.AvgLoss += pnl
+						analysis.AvgLoss += netPnL
 					}
 					// pnl == 0 的交易不计入盈利也不计入亏损，但计入总交易数
 
@@ -464,10 +495,10 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 					}
 					stats := analysis.SymbolStats[symbol]
 					stats.TotalTrades++
-					stats.TotalPnL += pnl
-					if pnl > 0 {
+					stats.TotalPnL += netPnL
+					if netPnL > 0 {
 						stats.WinningTrades++
-					} else if pnl < 0 {
+					} else if netPnL < 0 {
 						stats.LosingTrades++
 					}
 

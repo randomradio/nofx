@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"nofx/decision"
 	"nofx/logger"
 	"nofx/market"
@@ -67,22 +68,23 @@ type AutoTraderConfig struct {
 
 // AutoTrader 自动交易器
 type AutoTrader struct {
-	id                    string // Trader唯一标识
-	name                  string // Trader显示名称
-	aiModel               string // AI模型名称
-	exchange              string // 交易平台名称
-	config                AutoTraderConfig
-	trader                Trader // 使用Trader接口（支持多平台）
-	mcpClient             *mcp.Client
-	decisionLogger        *logger.DecisionLogger // 决策日志记录器
-	initialBalance        float64
-	dailyPnL              float64
-	lastResetTime         time.Time
-	stopUntil             time.Time
-	isRunning             bool
-	startTime             time.Time        // 系统启动时间
-	callCount             int              // AI调用次数
-	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	id                         string // Trader唯一标识
+	name                       string // Trader显示名称
+	aiModel                    string // AI模型名称
+	exchange                   string // 交易平台名称
+	config                     AutoTraderConfig
+	trader                     Trader // 使用Trader接口（支持多平台）
+	mcpClient                  *mcp.Client
+	decisionLogger             *logger.DecisionLogger // 决策日志记录器
+	initialBalance             float64
+	dailyPnL                   float64
+	lastResetTime              time.Time
+	stopUntil                  time.Time
+	isRunning                  bool
+	startTime                  time.Time          // 系统启动时间
+	callCount                  int                // AI调用次数
+	positionFirstSeenTime      map[string]int64   // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	processedCommissionTranIDs map[int64]struct{} // 已处理的手续费记录（避免重复计算）
 }
 
 // NewAutoTrader 创建自动交易器
@@ -163,20 +165,21 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 	decisionLogger := logger.NewDecisionLogger(logDir)
 
 	return &AutoTrader{
-		id:                    config.ID,
-		name:                  config.Name,
-		aiModel:               config.AIModel,
-		exchange:              config.Exchange,
-		config:                config,
-		trader:                trader,
-		mcpClient:             mcpClient,
-		decisionLogger:        decisionLogger,
-		initialBalance:        config.InitialBalance,
-		lastResetTime:         time.Now(),
-		startTime:             time.Now(),
-		callCount:             0,
-		isRunning:             false,
-		positionFirstSeenTime: make(map[string]int64),
+		id:                         config.ID,
+		name:                       config.Name,
+		aiModel:                    config.AIModel,
+		exchange:                   config.Exchange,
+		config:                     config,
+		trader:                     trader,
+		mcpClient:                  mcpClient,
+		decisionLogger:             decisionLogger,
+		initialBalance:             config.InitialBalance,
+		lastResetTime:              time.Now(),
+		startTime:                  time.Now(),
+		callCount:                  0,
+		isRunning:                  false,
+		positionFirstSeenTime:      make(map[string]int64),
+		processedCommissionTranIDs: make(map[int64]struct{}),
 	}, nil
 }
 
@@ -563,6 +566,107 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 	}
 }
 
+// fetchOrderFill 尝试获取订单的实际成交信息（限支持的交易所）
+func (at *AutoTrader) fetchOrderFill(symbol string, orderID int64) *OrderFillInfo {
+	fillFetcher, ok := at.trader.(OrderFillFetcher)
+	if !ok {
+		return nil
+	}
+
+	fillInfo, err := fillFetcher.GetOrderFillInfo(symbol, orderID)
+	if err != nil {
+		log.Printf("  ⚠ 获取成交明细失败: %v", err)
+		return nil
+	}
+
+	return fillInfo
+}
+
+// captureCommission 汇总最新的手续费记录（避免重复）
+func (at *AutoTrader) captureCommission(symbol string, placedAt time.Time) (float64, string) {
+	provider, ok := at.trader.(CommissionHistoryProvider)
+	if !ok {
+		return 0, ""
+	}
+
+	const maxAttempts = 5
+	const backoff = 200 * time.Millisecond
+
+	total := 0.0
+	asset := ""
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		entries, err := provider.GetRecentCommissions(symbol, placedAt)
+		if err != nil {
+			log.Printf("  ⚠ 获取手续费记录失败: %v", err)
+			return 0, ""
+		}
+
+		for _, entry := range entries {
+			if entry.Time.Before(placedAt.Add(-10 * time.Second)) {
+				continue
+			}
+			if _, exists := at.processedCommissionTranIDs[entry.TranID]; exists {
+				continue
+			}
+			at.processedCommissionTranIDs[entry.TranID] = struct{}{}
+			total += math.Abs(entry.Amount)
+			if asset == "" {
+				asset = entry.Asset
+			}
+		}
+
+		if total > 0 || attempt == maxAttempts-1 {
+			break
+		}
+
+		time.Sleep(backoff)
+	}
+
+	return total, asset
+}
+
+// adjustPositionSize 根据可用保证金调整仓位大小，避免触发保证金不足错误
+func (at *AutoTrader) adjustPositionSize(symbol string, desiredUSD float64, leverage int) (float64, float64, error) {
+	if desiredUSD <= 0 {
+		return 0, 0, fmt.Errorf("无效的仓位规模: %.2f USDT", desiredUSD)
+	}
+
+	if leverage <= 0 {
+		leverage = 1
+	}
+
+	balance, err := at.trader.GetBalance()
+	if err != nil {
+		return 0, 0, fmt.Errorf("获取账户余额失败: %w", err)
+	}
+
+	available := 0.0
+	if val, ok := balance["availableBalance"].(float64); ok {
+		available = val
+	}
+
+	if available <= 0 {
+		return 0, available, fmt.Errorf("可用保证金不足（%.2f USDT），无法开仓", available)
+	}
+
+	requiredMargin := desiredUSD / float64(leverage)
+	buffer := 1.03 // 额外预留保证金，避免因手续费/价格波动失败
+
+	// 如果可用保证金足够，直接返回原始仓位
+	if available >= requiredMargin*buffer {
+		return desiredUSD, available, nil
+	}
+
+	// 计算在给定杠杆下的最大可行仓位价值
+	maxUSD := (available / buffer) * float64(leverage)
+	if maxUSD <= 0 {
+		return 0, available, fmt.Errorf("保证金不足：可用 %.2f USDT，目标仓位需要 %.2f USDT（杠杆 %dx）", available, requiredMargin, leverage)
+	}
+
+	return maxUSD, available, nil
+}
+
 // executeOpenLongWithRecord 执行开多仓并记录详细信息
 func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📈 开多仓: %s", decision.Symbol)
@@ -583,12 +687,22 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		return err
 	}
 
+	plannedUSD := decision.PositionSizeUSD
+	adjustedUSD, available, err := at.adjustPositionSize(decision.Symbol, plannedUSD, decision.Leverage)
+	if err != nil {
+		return fmt.Errorf("%s 仓位检查失败: %w", decision.Symbol, err)
+	}
+	if math.Abs(adjustedUSD-plannedUSD) > 0.01 {
+		log.Printf("  ⚠ 保证金不足，自动调整仓位价值: %.2f → %.2f USDT（可用保证金 %.2f USDT）", plannedUSD, adjustedUSD, available)
+	}
+
 	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	quantity := adjustedUSD / marketData.CurrentPrice
 	actionRecord.Quantity = quantity
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 开仓
+	orderPlacedAt := time.Now()
 	order, err := at.trader.OpenLong(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
 		return err
@@ -597,6 +711,26 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// 记录订单ID
 	if orderID, ok := order["orderId"].(int64); ok {
 		actionRecord.OrderID = orderID
+		if fillInfo := at.fetchOrderFill(decision.Symbol, orderID); fillInfo != nil {
+			if fillInfo.Quantity > 0 {
+				actionRecord.Quantity = fillInfo.Quantity
+				quantity = fillInfo.Quantity
+			}
+			if fillInfo.AvgPrice > 0 {
+				actionRecord.Price = fillInfo.AvgPrice
+			}
+			if fillInfo.Commission > 0 {
+				actionRecord.Commission += fillInfo.Commission
+				actionRecord.CommissionAsset = fillInfo.CommissionAsset
+			}
+		}
+	}
+
+	if commission, asset := at.captureCommission(decision.Symbol, orderPlacedAt); commission > 0 {
+		actionRecord.Commission += commission
+		if actionRecord.CommissionAsset == "" {
+			actionRecord.CommissionAsset = asset
+		}
 	}
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
@@ -636,12 +770,22 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		return err
 	}
 
+	plannedUSD := decision.PositionSizeUSD
+	adjustedUSD, available, err := at.adjustPositionSize(decision.Symbol, plannedUSD, decision.Leverage)
+	if err != nil {
+		return fmt.Errorf("%s 仓位检查失败: %w", decision.Symbol, err)
+	}
+	if math.Abs(adjustedUSD-plannedUSD) > 0.01 {
+		log.Printf("  ⚠ 保证金不足，自动调整仓位价值: %.2f → %.2f USDT（可用保证金 %.2f USDT）", plannedUSD, adjustedUSD, available)
+	}
+
 	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	quantity := adjustedUSD / marketData.CurrentPrice
 	actionRecord.Quantity = quantity
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 开仓
+	orderPlacedAt := time.Now()
 	order, err := at.trader.OpenShort(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
 		return err
@@ -650,6 +794,26 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// 记录订单ID
 	if orderID, ok := order["orderId"].(int64); ok {
 		actionRecord.OrderID = orderID
+		if fillInfo := at.fetchOrderFill(decision.Symbol, orderID); fillInfo != nil {
+			if fillInfo.Quantity > 0 {
+				actionRecord.Quantity = fillInfo.Quantity
+				quantity = fillInfo.Quantity
+			}
+			if fillInfo.AvgPrice > 0 {
+				actionRecord.Price = fillInfo.AvgPrice
+			}
+			if fillInfo.Commission > 0 {
+				actionRecord.Commission += fillInfo.Commission
+				actionRecord.CommissionAsset = fillInfo.CommissionAsset
+			}
+		}
+	}
+
+	if commission, asset := at.captureCommission(decision.Symbol, orderPlacedAt); commission > 0 {
+		actionRecord.Commission += commission
+		if actionRecord.CommissionAsset == "" {
+			actionRecord.CommissionAsset = asset
+		}
 	}
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
@@ -681,22 +845,42 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 平仓
-    order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
-    if err != nil {
-        // 已无多仓的情况视为已平仓，清理挂单后返回成功
-        if strings.Contains(err.Error(), "没有找到") && strings.Contains(err.Error(), "多仓") {
-            log.Printf("  ℹ %s 已无多仓，视为已平仓", decision.Symbol)
-            if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
-                log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
-            }
-            return nil
-        }
-        return err
-    }
+	orderPlacedAt := time.Now()
+	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
+	if err != nil {
+		// 已无多仓的情况视为已平仓，清理挂单后返回成功
+		if strings.Contains(err.Error(), "没有找到") && strings.Contains(err.Error(), "多仓") {
+			log.Printf("  ℹ %s 已无多仓，视为已平仓", decision.Symbol)
+			if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
+				log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
+			}
+			return nil
+		}
+		return err
+	}
 
 	// 记录订单ID
 	if orderID, ok := order["orderId"].(int64); ok {
 		actionRecord.OrderID = orderID
+		if fillInfo := at.fetchOrderFill(decision.Symbol, orderID); fillInfo != nil {
+			if fillInfo.Quantity > 0 {
+				actionRecord.Quantity = fillInfo.Quantity
+			}
+			if fillInfo.AvgPrice > 0 {
+				actionRecord.Price = fillInfo.AvgPrice
+			}
+			if fillInfo.Commission > 0 {
+				actionRecord.Commission += fillInfo.Commission
+				actionRecord.CommissionAsset = fillInfo.CommissionAsset
+			}
+		}
+	}
+
+	if commission, asset := at.captureCommission(decision.Symbol, orderPlacedAt); commission > 0 {
+		actionRecord.Commission += commission
+		if actionRecord.CommissionAsset == "" {
+			actionRecord.CommissionAsset = asset
+		}
 	}
 
 	log.Printf("  ✓ 平仓成功")
@@ -715,22 +899,42 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 平仓
-    order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
-    if err != nil {
-        // 已无空仓的情况视为已平仓，清理挂单后返回成功
-        if strings.Contains(err.Error(), "没有找到") && strings.Contains(err.Error(), "空仓") {
-            log.Printf("  ℹ %s 已无空仓，视为已平仓", decision.Symbol)
-            if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
-                log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
-            }
-            return nil
-        }
-        return err
-    }
+	orderPlacedAt := time.Now()
+	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
+	if err != nil {
+		// 已无空仓的情况视为已平仓，清理挂单后返回成功
+		if strings.Contains(err.Error(), "没有找到") && strings.Contains(err.Error(), "空仓") {
+			log.Printf("  ℹ %s 已无空仓，视为已平仓", decision.Symbol)
+			if cancelErr := at.trader.CancelAllOrders(decision.Symbol); cancelErr != nil {
+				log.Printf("  ⚠ 取消挂单失败: %v", cancelErr)
+			}
+			return nil
+		}
+		return err
+	}
 
 	// 记录订单ID
 	if orderID, ok := order["orderId"].(int64); ok {
 		actionRecord.OrderID = orderID
+		if fillInfo := at.fetchOrderFill(decision.Symbol, orderID); fillInfo != nil {
+			if fillInfo.Quantity > 0 {
+				actionRecord.Quantity = fillInfo.Quantity
+			}
+			if fillInfo.AvgPrice > 0 {
+				actionRecord.Price = fillInfo.AvgPrice
+			}
+			if fillInfo.Commission > 0 {
+				actionRecord.Commission += fillInfo.Commission
+				actionRecord.CommissionAsset = fillInfo.CommissionAsset
+			}
+		}
+	}
+
+	if commission, asset := at.captureCommission(decision.Symbol, orderPlacedAt); commission > 0 {
+		actionRecord.Commission += commission
+		if actionRecord.CommissionAsset == "" {
+			actionRecord.CommissionAsset = asset
+		}
 	}
 
 	log.Printf("  ✓ 平仓成功")

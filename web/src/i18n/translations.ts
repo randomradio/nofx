@@ -104,6 +104,8 @@ export const translations = {
     completedTradesWillAppear: 'Completed trades will appear here',
     entry: 'Entry',
     exit: 'Exit',
+    fees: 'Fees',
+    grossPnL: 'Gross P&L',
     stopLoss: 'Stop Loss',
     latest: 'Latest',
 
@@ -222,6 +224,8 @@ export const translations = {
     completedTradesWillAppear: '已完成的交易将显示在这里',
     entry: '入场',
     exit: '出场',
+    fees: '手续费',
+    grossPnL: '总盈亏（未扣费）',
     stopLoss: '止损',
     latest: '最新',
 
