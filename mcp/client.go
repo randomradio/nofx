@@ -31,6 +31,9 @@ type Client struct {
 	Timeout    time.Duration
 	UseFullURL bool // 是否使用完整URL（不添加/chat/completions）
 	MaxTokens  int  // AI响应的最大token数
+
+	// 可选：调用日志回调（用于记录token消耗与往返）
+	onCall func(entry *LLMCall)
 }
 
 func New() *Client {
@@ -96,7 +99,7 @@ func (client *Client) SetQwenAPIKey(apiKey string, customURL string, customModel
 		client.Model = customModel
 		log.Printf("🔧 [MCP] Qwen 使用自定义 Model: %s", customModel)
 	} else {
-		client.Model = "qwen3-max" 
+		client.Model = "qwen3-max"
 		log.Printf("🔧 [MCP] Qwen 使用默认 Model: %s", client.Model)
 	}
 	// 打印 API Key 的前后各4位用于验证
@@ -129,6 +132,25 @@ func (client *Client) SetClient(Client Client) {
 		Client.Timeout = 30 * time.Second
 	}
 	client = &Client
+}
+
+// LLMCall 描述一次模型调用
+type LLMCall struct {
+	Provider         Provider
+	Model            string
+	SystemPrompt     string
+	UserPrompt       string
+	ResponseText     string
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	LatencyMs        int
+	Error            string
+}
+
+// SetOnCall 设置调用回调
+func (client *Client) SetOnCall(cb func(entry *LLMCall)) {
+	client.onCall = cb
 }
 
 // CallWithMessages 使用 system + user prompt 调用AI API（推荐）
@@ -173,6 +195,7 @@ func (client *Client) CallWithMessages(systemPrompt, userPrompt string) (string,
 
 // callOnce 单次调用AI API（内部使用）
 func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) {
+	start := time.Now()
 	// 打印当前 AI 配置
 	log.Printf("📡 [MCP] AI 请求配置:")
 	log.Printf("   Provider: %s", client.Provider)
@@ -264,13 +287,18 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 		return "", fmt.Errorf("API返回错误 (status %d): %s", resp.StatusCode, string(body))
 	}
 
-	// 解析响应
+	// 解析响应（OpenAI兼容：choices + usage）
 	var result struct {
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
@@ -280,8 +308,25 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("API返回空响应")
 	}
+	content := result.Choices[0].Message.Content
 
-	return result.Choices[0].Message.Content, nil
+	// 回调记录
+	if client.onCall != nil {
+		entry := &LLMCall{
+			Provider:         client.Provider,
+			Model:            client.Model,
+			SystemPrompt:     systemPrompt,
+			UserPrompt:       userPrompt,
+			ResponseText:     content,
+			PromptTokens:     result.Usage.PromptTokens,
+			CompletionTokens: result.Usage.CompletionTokens,
+			TotalTokens:      result.Usage.TotalTokens,
+			LatencyMs:        int(time.Since(start) / time.Millisecond),
+		}
+		client.onCall(entry)
+	}
+
+	return content, nil
 }
 
 // isRetryableError 判断错误是否可重试

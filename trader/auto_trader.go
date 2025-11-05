@@ -99,6 +99,9 @@ type AutoTrader struct {
 	startTime             time.Time        // 系统启动时间
 	callCount             int              // AI调用次数
 	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+
+	// 可选：持久化决策记录回调（由上层注入以写入数据库）
+	onDecision func(record *logger.DecisionRecord)
 }
 
 // NewAutoTrader 创建自动交易器
@@ -220,6 +223,29 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 	}, nil
 }
 
+// SetLLMLogCallback 透传设置到 mcp 客户端以记录 LLM 调用
+func (at *AutoTrader) SetLLMLogCallback(cb func(entry *mcp.LLMCall)) {
+	if at.mcpClient != nil {
+		at.mcpClient.SetOnCall(cb)
+	}
+}
+
+// SetDecisionPersist 设置决策持久化回调
+func (at *AutoTrader) SetDecisionPersist(cb func(record *logger.DecisionRecord)) {
+	at.onDecision = cb
+}
+
+// logDecision 统一记录决策：文件 + 可选回调（例如写数据库）
+func (at *AutoTrader) logDecision(record *logger.DecisionRecord) error {
+	if err := at.decisionLogger.LogDecision(record); err != nil {
+		return err
+	}
+	if at.onDecision != nil {
+		at.onDecision(record)
+	}
+	return nil
+}
+
 // Run 运行自动交易主循环
 func (at *AutoTrader) Run() error {
 	at.isRunning = true
@@ -274,7 +300,7 @@ func (at *AutoTrader) runCycle() error {
 		log.Printf("⏸ 风险控制：暂停交易中，剩余 %.0f 分钟", remaining.Minutes())
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("风险控制暂停中，剩余 %.0f 分钟", remaining.Minutes())
-		at.decisionLogger.LogDecision(record)
+		at.logDecision(record)
 		return nil
 	}
 
@@ -290,7 +316,7 @@ func (at *AutoTrader) runCycle() error {
 	if err != nil {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("构建交易上下文失败: %v", err)
-		at.decisionLogger.LogDecision(record)
+		at.logDecision(record)
 		return fmt.Errorf("构建交易上下文失败: %w", err)
 	}
 
@@ -363,7 +389,7 @@ func (at *AutoTrader) runCycle() error {
 			}
 		}
 
-		at.decisionLogger.LogDecision(record)
+		at.logDecision(record)
 		return fmt.Errorf("获取AI决策失败: %w", err)
 	}
 
@@ -428,7 +454,7 @@ func (at *AutoTrader) runCycle() error {
 	}
 
 	// 9. 保存决策记录
-	if err := at.decisionLogger.LogDecision(record); err != nil {
+	if err := at.logDecision(record); err != nil {
 		log.Printf("⚠ 保存决策记录失败: %v", err)
 	}
 

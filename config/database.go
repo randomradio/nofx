@@ -138,6 +138,38 @@ func (d *Database) createTables() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 
+		// 决策记录（JSON快照 + 可检索字段）
+		`CREATE TABLE IF NOT EXISTS decision_records (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT NOT NULL,
+			trader_id TEXT NOT NULL,
+			timestamp DATETIME NOT NULL,
+			cycle_number INTEGER NOT NULL,
+			success BOOLEAN NOT NULL,
+			error_message TEXT DEFAULT '',
+			record_json TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+
+		// LLM 交互日志（包含 token 消耗）
+		`CREATE TABLE IF NOT EXISTS llm_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT NOT NULL,
+			trader_id TEXT NOT NULL,
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			system_prompt TEXT DEFAULT '',
+			user_prompt TEXT NOT NULL,
+			response_text TEXT NOT NULL,
+			prompt_tokens INTEGER DEFAULT 0,
+			completion_tokens INTEGER DEFAULT 0,
+			total_tokens INTEGER DEFAULT 0,
+			latency_ms INTEGER DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+
 		// 触发器：自动更新 updated_at
 		`CREATE TRIGGER IF NOT EXISTS update_users_updated_at
 			AFTER UPDATE ON users
@@ -181,6 +213,10 @@ func (d *Database) createTables() error {
 			return fmt.Errorf("执行SQL失败 [%s]: %w", query, err)
 		}
 	}
+
+	// 为新的日志表创建索引（如果不存在）
+	_, _ = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_decision_records_user_trader_time ON decision_records(user_id, trader_id, timestamp)`)
+	_, _ = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_llm_logs_user_trader_time ON llm_logs(user_id, trader_id, created_at)`)
 
 	// 为现有数据库添加新字段（向后兼容）
 	alterQueries := []string{
@@ -962,6 +998,24 @@ func (d *Database) UpdateUserSignalSource(userID, coinPoolURL, oiTopURL string) 
 		UPDATE user_signal_sources SET coin_pool_url = ?, oi_top_url = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE user_id = ?
 	`, coinPoolURL, oiTopURL, userID)
+	return err
+}
+
+// InsertDecisionRecord 将决策记录保存到数据库（以JSON整体快照存储）
+func (d *Database) InsertDecisionRecord(userID, traderID string, timestamp time.Time, cycleNumber int, success bool, errorMessage string, recordJSON []byte) error {
+	_, err := d.db.Exec(`
+        INSERT INTO decision_records (user_id, trader_id, timestamp, cycle_number, success, error_message, record_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `, userID, traderID, timestamp.Format("2006-01-02 15:04:05"), cycleNumber, success, errorMessage, string(recordJSON))
+	return err
+}
+
+// InsertLLMLog 记录一次 LLM 交互及 Token 消耗
+func (d *Database) InsertLLMLog(userID, traderID, provider, model, systemPrompt, userPrompt, responseText string, promptTokens, completionTokens, totalTokens, latencyMs int) error {
+	_, err := d.db.Exec(`
+        INSERT INTO llm_logs (user_id, trader_id, provider, model, system_prompt, user_prompt, response_text, prompt_tokens, completion_tokens, total_tokens, latency_ms, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `, userID, traderID, provider, model, systemPrompt, userPrompt, responseText, promptTokens, completionTokens, totalTokens, latencyMs)
 	return err
 }
 

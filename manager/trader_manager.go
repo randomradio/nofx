@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"nofx/config"
+	"nofx/logger"
+	"nofx/mcp"
 	"nofx/trader"
 	"sort"
 	"strconv"
@@ -26,6 +28,7 @@ type TraderManager struct {
 	traders          map[string]*trader.AutoTrader // key: trader ID
 	competitionCache *CompetitionCache
 	mu               sync.RWMutex
+	database         *config.Database
 }
 
 // NewTraderManager 创建trader管理器
@@ -40,6 +43,7 @@ func NewTraderManager() *TraderManager {
 
 // LoadTradersFromDatabase 从数据库加载所有交易员到内存
 func (tm *TraderManager) LoadTradersFromDatabase(database *config.Database) error {
+	tm.database = database
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -267,6 +271,22 @@ func (tm *TraderManager) addTraderFromDB(traderCfg *config.TraderRecord, aiModel
 		return fmt.Errorf("创建trader失败: %w", err)
 	}
 
+	// 注入 LLM 调用与决策持久化回调
+	if tm.database != nil {
+		uid := traderCfg.UserID
+		tid := traderCfg.ID
+		at.SetLLMLogCallback(func(entry *mcp.LLMCall) {
+			_ = tm.database.InsertLLMLog(uid, tid, string(entry.Provider), entry.Model, entry.SystemPrompt, entry.UserPrompt, entry.ResponseText, entry.PromptTokens, entry.CompletionTokens, entry.TotalTokens, entry.LatencyMs)
+		})
+		at.SetDecisionPersist(func(record *logger.DecisionRecord) {
+			data, err := json.Marshal(record)
+			if err != nil {
+				return
+			}
+			_ = tm.database.InsertDecisionRecord(uid, tid, record.Timestamp, record.CycleNumber, record.Success, record.ErrorMessage, data)
+		})
+	}
+
 	// 设置自定义prompt（如果有）
 	if traderCfg.CustomPrompt != "" {
 		at.SetCustomPrompt(traderCfg.CustomPrompt)
@@ -371,6 +391,21 @@ func (tm *TraderManager) AddTraderFromDB(traderCfg *config.TraderRecord, aiModel
 	at, err := trader.NewAutoTrader(traderConfig)
 	if err != nil {
 		return fmt.Errorf("创建trader失败: %w", err)
+	}
+
+	if tm.database != nil {
+		uid := traderCfg.UserID
+		tid := traderCfg.ID
+		at.SetLLMLogCallback(func(entry *mcp.LLMCall) {
+			_ = tm.database.InsertLLMLog(uid, tid, string(entry.Provider), entry.Model, entry.SystemPrompt, entry.UserPrompt, entry.ResponseText, entry.PromptTokens, entry.CompletionTokens, entry.TotalTokens, entry.LatencyMs)
+		})
+		at.SetDecisionPersist(func(record *logger.DecisionRecord) {
+			data, err := json.Marshal(record)
+			if err != nil {
+				return
+			}
+			_ = tm.database.InsertDecisionRecord(uid, tid, record.Timestamp, record.CycleNumber, record.Success, record.ErrorMessage, data)
+		})
 	}
 
 	// 设置自定义prompt（如果有）
