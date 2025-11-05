@@ -253,10 +253,7 @@ func main() {
 	}
 
 	oiTopAPIURL, _ := database.GetSystemConfig("oi_top_api_url")
-	if oiTopAPIURL != "" {
-		pool.SetOITopAPI(oiTopAPIURL)
-		log.Printf("✓ 已配置OI Top API")
-	}
+	pool.SetOITopAPI(oiTopAPIURL)
 
 	// 创建TraderManager
 	traderManager := manager.NewTraderManager()

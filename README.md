@@ -634,7 +634,7 @@ For running multiple AI traders competing against each other:
   ],
   "use_default_coins": true,
   "coin_pool_api_url": "",
-  "oi_top_api_url": "",
+  "oi_top_api_url": "binance",
   "api_server_port": 8080
 }
 ```
@@ -670,8 +670,10 @@ For running multiple AI traders competing against each other:
 | `altcoin_leverage` | Maximum leverage for altcoins<br>⚠️ Subaccounts: ≤5x | `5` (default, safe)<br>`20` (main account max) | ✅ Yes |
 | `use_default_coins` | Use built-in coin list<br>**✨ Smart Default: `true`** (v2.0.2+)<br>Auto-enabled if no API URL provided | `true` or omit | ❌ No<br>(Optional, auto-defaults) |
 | `coin_pool_api_url` | Custom coin pool API<br>*Only needed when `use_default_coins: false`* | `""` (empty) | ❌ No |
-| `oi_top_api_url` | Open interest API<br>*Optional supplement data* | `""` (empty) | ❌ No |
+| `oi_top_api_url` | Open interest API<br>`binance` uses Binance official OI endpoint | `"binance"` | ❌ No |
 | `api_server_port` | Web dashboard port | `8080` | ✅ Yes |
+
+> ℹ️ Leave `oi_top_api_url` empty or set to `binance` to use Binance's `/fapi/v1/openInterest`. Provide a full URL for a custom service, or set to `none` to disable OI enrichment.
 
 ~~**Default Trading Coins** (when `use_default_coins: true`):
 - BTC, ETH, SOL, BNB, XRP, DOGE, ADA, HYPE~~
@@ -757,7 +759,7 @@ This makes it beginner-friendly! You can even omit this field entirely.
 ```json
 "use_default_coins": true,
 "coin_pool_api_url": "",
-"oi_top_api_url": ""
+"oi_top_api_url": "binance"
 ```
 
 ✅ **Option 2: Omit the field (uses default coins automatically)**
@@ -765,6 +767,7 @@ This makes it beginner-friendly! You can even omit this field entirely.
 // Just don't include "use_default_coins" at all
 "coin_pool_api_url": "",
 "oi_top_api_url": ""
+// Empty string also falls back to Binance OI
 ```
 
 ⚙️ **Advanced: Use external API**
