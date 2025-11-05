@@ -10,17 +10,11 @@ import (
 	"time"
 )
 
-const (
-	TriggerReasonStopLoss    = "STOP_LOSS"
-	TriggerReasonTakeProfit  = "TAKE_PROFIT"
-	TriggerReasonLiquidation = "LIQUIDATION"
-	TriggerReasonUnknown     = "UNKNOWN"
-)
-
 // DecisionRecord 决策记录
 type DecisionRecord struct {
 	Timestamp      time.Time          `json:"timestamp"`       // 决策时间
 	CycleNumber    int                `json:"cycle_number"`    // 周期编号
+	SystemPrompt   string             `json:"system_prompt"`   // 系统提示词（发送给AI的系统prompt）
 	InputPrompt    string             `json:"input_prompt"`    // 发送给AI的输入prompt
 	CoTTrace       string             `json:"cot_trace"`       // AI思维链（输出）
 	DecisionJSON   string             `json:"decision_json"`   // 决策JSON
@@ -56,19 +50,15 @@ type PositionSnapshot struct {
 
 // DecisionAction 决策动作
 type DecisionAction struct {
-	Action          string    `json:"action"`           // open_long, open_short, close_long, close_short
-	Symbol          string    `json:"symbol"`           // 币种
-	Quantity        float64   `json:"quantity"`         // 数量
-	Leverage        int       `json:"leverage"`         // 杠杆（开仓时）
-	Price           float64   `json:"price"`            // 执行价格
-	OrderID         int64     `json:"order_id"`         // 订单ID
-	Timestamp       time.Time `json:"timestamp"`        // 执行时间
-	Success         bool      `json:"success"`          // 是否成功
-	Error           string    `json:"error"`            // 错误信息
-	Commission      float64   `json:"commission"`       // 手续费
-	CommissionAsset string    `json:"commission_asset"` // 手续费资产
-	Source          string    `json:"source,omitempty"` // 数据来源（ai_decision/auto_trigger等）
-	TriggerReason   string    `json:"trigger_reason,omitempty"`
+	Action    string    `json:"action"`    // open_long, open_short, close_long, close_short, update_stop_loss, update_take_profit, partial_close
+	Symbol    string    `json:"symbol"`    // 币种
+	Quantity  float64   `json:"quantity"`  // 数量（部分平仓时使用）
+	Leverage  int       `json:"leverage"`  // 杠杆（开仓时）
+	Price     float64   `json:"price"`     // 执行价格
+	OrderID   int64     `json:"order_id"`  // 订单ID
+	Timestamp time.Time `json:"timestamp"` // 执行时间
+	Success   bool      `json:"success"`   // 是否成功
+	Error     string    `json:"error"`     // 错误信息
 }
 
 // DecisionLogger 决策日志记录器
@@ -253,8 +243,9 @@ func (l *DecisionLogger) GetStatistics() (*Statistics, error) {
 				switch action.Action {
 				case "open_long", "open_short":
 					stats.TotalOpenPositions++
-				case "close_long", "close_short":
+				case "close_long", "close_short", "partial_close":
 					stats.TotalClosePositions++
+				// update_stop_loss 和 update_take_profit 不計入統計
 				}
 			}
 		}
@@ -288,17 +279,12 @@ type TradeOutcome struct {
 	ClosePrice    float64   `json:"close_price"`    // 平仓价
 	PositionValue float64   `json:"position_value"` // 仓位价值（quantity × openPrice）
 	MarginUsed    float64   `json:"margin_used"`    // 保证金使用（positionValue / leverage）
-	GrossPnL      float64   `json:"gross_pn_l"`     // 扣除手续费前盈亏
 	PnL           float64   `json:"pn_l"`           // 盈亏（USDT）
-	Fee           float64   `json:"fee"`            // 手续费合计
-	FeeAsset      string    `json:"fee_asset"`      // 手续费资产
-	GrossPnLPct   float64   `json:"gross_pn_l_pct"` // 手续费前盈亏百分比
 	PnLPct        float64   `json:"pn_l_pct"`       // 盈亏百分比（相对保证金）
 	Duration      string    `json:"duration"`       // 持仓时长
 	OpenTime      time.Time `json:"open_time"`      // 开仓时间
 	CloseTime     time.Time `json:"close_time"`     // 平仓时间
 	WasStopLoss   bool      `json:"was_stop_loss"`  // 是否止损
-	TriggerReason string    `json:"trigger_reason"` // 触发原因（止损/止盈/强平/未知）
 }
 
 // PerformanceAnalysis 交易表现分析
@@ -363,28 +349,38 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 
 				symbol := action.Symbol
 				side := ""
-				if action.Action == "open_long" || action.Action == "close_long" {
+				if action.Action == "open_long" || action.Action == "close_long" || action.Action == "partial_close" {
 					side = "long"
 				} else if action.Action == "open_short" || action.Action == "close_short" {
 					side = "short"
 				}
+
+				// partial_close 需要根據持倉判斷方向
+				if action.Action == "partial_close" && side == "" {
+					for key, pos := range openPositions {
+						if posSymbol, _ := pos["side"].(string); key == symbol+"_"+posSymbol {
+							side = posSymbol
+							break
+						}
+					}
+				}
+
 				posKey := symbol + "_" + side
 
 				switch action.Action {
 				case "open_long", "open_short":
 					// 记录开仓
 					openPositions[posKey] = map[string]interface{}{
-						"side":            side,
-						"openPrice":       action.Price,
-						"openTime":        action.Timestamp,
-						"quantity":        action.Quantity,
-						"leverage":        action.Leverage,
-						"commission":      action.Commission,
-						"commissionAsset": action.CommissionAsset,
+						"side":      side,
+						"openPrice": action.Price,
+						"openTime":  action.Timestamp,
+						"quantity":  action.Quantity,
+						"leverage":  action.Leverage,
 					}
 				case "close_long", "close_short":
 					// 移除已平仓记录
 					delete(openPositions, posKey)
+				// partial_close 不處理，保留持倉記錄
 				}
 			}
 		}
@@ -399,103 +395,96 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 
 			symbol := action.Symbol
 			side := ""
-			if action.Action == "open_long" || action.Action == "close_long" {
+			if action.Action == "open_long" || action.Action == "close_long" || action.Action == "partial_close" {
 				side = "long"
 			} else if action.Action == "open_short" || action.Action == "close_short" {
 				side = "short"
 			}
+
+			// partial_close 需要根據持倉判斷方向
+			if action.Action == "partial_close" {
+				// 從 openPositions 中查找持倉方向
+				for key, pos := range openPositions {
+					if posSymbol, _ := pos["side"].(string); key == symbol+"_"+posSymbol {
+						side = posSymbol
+						break
+					}
+				}
+			}
+
 			posKey := symbol + "_" + side // 使用symbol_side作为key，区分多空持仓
 
 			switch action.Action {
 			case "open_long", "open_short":
 				// 更新开仓记录（可能已经在预填充时记录过了）
 				openPositions[posKey] = map[string]interface{}{
-					"side":            side,
-					"openPrice":       action.Price,
-					"openTime":        action.Timestamp,
-					"quantity":        action.Quantity,
-					"leverage":        action.Leverage,
-					"commission":      action.Commission,
-					"commissionAsset": action.CommissionAsset,
+					"side":      side,
+					"openPrice": action.Price,
+					"openTime":  action.Timestamp,
+					"quantity":  action.Quantity,
+					"leverage":  action.Leverage,
 				}
 
-			case "close_long", "close_short":
+			case "close_long", "close_short", "partial_close":
 				// 查找对应的开仓记录（可能来自预填充或当前窗口）
 				if openPos, exists := openPositions[posKey]; exists {
 					openPrice := openPos["openPrice"].(float64)
 					openTime := openPos["openTime"].(time.Time)
 					side := openPos["side"].(string)
 					quantity := openPos["quantity"].(float64)
-					if quantity == 0 && action.Quantity > 0 {
-						quantity = action.Quantity
-					}
 					leverage := openPos["leverage"].(int)
-					openCommission := 0.0
-					if commission, ok := openPos["commission"].(float64); ok {
-						openCommission = commission
-					}
-					commissionAsset := action.CommissionAsset
-					if commissionAsset == "" {
-						if asset, ok := openPos["commissionAsset"].(string); ok {
-							commissionAsset = asset
-						}
+
+					// 对于 partial_close，使用实际平仓数量；否则使用完整仓位数量
+					actualQuantity := quantity
+					if action.Action == "partial_close" {
+						actualQuantity = action.Quantity
 					}
 
 					// 计算实际盈亏（USDT）
-					// 合约交易 PnL 计算：quantity × 价格差
+					// 合约交易 PnL 计算：actualQuantity × 价格差
 					// 注意：杠杆不影响绝对盈亏，只影响保证金需求
-					var grossPnL float64
+					var pnl float64
 					if side == "long" {
-						grossPnL = quantity * (action.Price - openPrice)
+						pnl = actualQuantity * (action.Price - openPrice)
 					} else {
-						grossPnL = quantity * (openPrice - action.Price)
+						pnl = actualQuantity * (openPrice - action.Price)
 					}
-					totalFees := openCommission + action.Commission
-					netPnL := grossPnL - totalFees
 
 					// 计算盈亏百分比（相对保证金）
-					positionValue := quantity * openPrice
+					positionValue := actualQuantity * openPrice
 					marginUsed := positionValue / float64(leverage)
-					grossPnLPct := 0.0
-					netPnLPct := 0.0
+					pnlPct := 0.0
 					if marginUsed > 0 {
-						grossPnLPct = (grossPnL / marginUsed) * 100
-						netPnLPct = (netPnL / marginUsed) * 100
+						pnlPct = (pnl / marginUsed) * 100
 					}
 
 					// 记录交易结果
 					outcome := TradeOutcome{
 						Symbol:        symbol,
 						Side:          side,
-						Quantity:      quantity,
+						Quantity:      actualQuantity,
 						Leverage:      leverage,
 						OpenPrice:     openPrice,
 						ClosePrice:    action.Price,
 						PositionValue: positionValue,
 						MarginUsed:    marginUsed,
-						GrossPnL:      grossPnL,
-						PnL:           netPnL,
-						Fee:           totalFees,
-						FeeAsset:      commissionAsset,
-						GrossPnLPct:   grossPnLPct,
-						PnLPct:        netPnLPct,
+						PnL:           pnl,
+						PnLPct:        pnlPct,
 						Duration:      action.Timestamp.Sub(openTime).String(),
 						OpenTime:      openTime,
 						CloseTime:     action.Timestamp,
-						TriggerReason: action.TriggerReason,
 					}
-					outcome.WasStopLoss = action.TriggerReason == TriggerReasonStopLoss
 
 					analysis.RecentTrades = append(analysis.RecentTrades, outcome)
 					analysis.TotalTrades++
 
 					// 分类交易：盈利、亏损、持平（避免将pnl=0算入亏损）
-					if netPnL > 0 {
+					if pnl > 0 {
 						analysis.WinningTrades++
-						analysis.AvgWin += netPnL
-					} else if netPnL < 0 {
+						analysis.AvgWin += pnl
+					} else if pnl < 0 {
 						analysis.LosingTrades++
-						analysis.AvgLoss += netPnL
+						analysis.AvgLoss += pnl
 					}
 					// pnl == 0 的交易不计入盈利也不计入亏损，但计入总交易数
 
@@ -507,15 +496,17 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 					}
 					stats := analysis.SymbolStats[symbol]
 					stats.TotalTrades++
-					stats.TotalPnL += netPnL
-					if netPnL > 0 {
+					stats.TotalPnL += pnl
+					if pnl > 0 {
 						stats.WinningTrades++
-					} else if netPnL < 0 {
+					} else if pnl < 0 {
 						stats.LosingTrades++
 					}
 
-					// 移除已平仓记录
-					delete(openPositions, posKey)
+					// 移除已平仓记录（partial_close 不刪除，因為還有剩餘倉位）
+					if action.Action != "partial_close" {
+						delete(openPositions, posKey)
+					}
 				}
 			}
 		}

@@ -50,28 +50,31 @@ type LeverageConfig struct {
 	AltcoinLeverage int `json:"altcoin_leverage"` // 山寨币的杠杆倍数（主账户建议5-20，子账户≤5）
 }
 
+// LogConfig 日志配置
+type LogConfig struct {
+	Level    string          `json:"level"`    // 日志级别: debug, info, warn, error (默认: info)
+	Telegram *TelegramConfig `json:"telegram"` // Telegram推送配置（可选）
+}
+
+// TelegramConfig Telegram推送配置（简化版，只保留必需字段）
+type TelegramConfig struct {
+	Enabled  bool   `json:"enabled"`   // 是否启用（默认: false）
+	BotToken string `json:"bot_token"` // Bot Token
+	ChatID   int64  `json:"chat_id"`   // Chat ID
+	MinLevel string `json:"min_level"` // 最低日志级别，该级别及以上的日志会推送到Telegram（可选，默认: error）
+}
+
 // Config 总配置
 type Config struct {
 	Traders            []TraderConfig `json:"traders"`
 	UseDefaultCoins    bool           `json:"use_default_coins"` // 是否使用默认主流币种列表
 	DefaultCoins       []string       `json:"default_coins"`     // 默认主流币种池
-	CoinPoolAPIURL     string         `json:"coin_pool_api_url"`
-	OITopAPIURL        string         `json:"oi_top_api_url"`
 	APIServerPort      int            `json:"api_server_port"`
 	MaxDailyLoss       float64        `json:"max_daily_loss"`
 	MaxDrawdown        float64        `json:"max_drawdown"`
 	StopTradingMinutes int            `json:"stop_trading_minutes"`
 	Leverage           LeverageConfig `json:"leverage"` // 杠杆配置
-	Auth               AuthConfig     `json:"auth"`
-}
-
-// AuthConfig API认证配置
-type AuthConfig struct {
-	Enabled         bool   `json:"enabled"`
-	Username        string `json:"username"`
-	Password        string `json:"password"`
-	TokenSecret     string `json:"token_secret"`
-	TokenTTLMinutes int    `json:"token_ttl_minutes"`
+	Log                *LogConfig     `json:"log"`      // 日志配置（可选）
 }
 
 // LoadConfig 从文件加载配置
@@ -86,8 +89,8 @@ func LoadConfig(filename string) (*Config, error) {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
-	// 设置默认值：如果use_default_coins未设置（为false）且没有配置coin_pool_api_url，则默认使用默认币种列表
-	if !config.UseDefaultCoins && config.CoinPoolAPIURL == "" {
+	// 设置默认值：确保使用默认币种列表
+	if !config.UseDefaultCoins {
 		config.UseDefaultCoins = true
 	}
 
@@ -200,26 +203,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Leverage.AltcoinLeverage > 5 {
 		fmt.Printf("⚠️  警告: 山寨币杠杆设置为%dx，如果使用子账户可能会失败（子账户限制≤5x）\n", c.Leverage.AltcoinLeverage)
-	}
-
-	// 处理认证配置
-	if c.Auth.Username != "" || c.Auth.Password != "" || c.Auth.Enabled {
-		c.Auth.Enabled = true
-	}
-	if c.Auth.Enabled {
-		if c.Auth.Username == "" {
-			return fmt.Errorf("auth.username不能为空（启用认证时）")
-		}
-		if c.Auth.Password == "" {
-			return fmt.Errorf("auth.password不能为空（启用认证时）")
-		}
-		if c.Auth.TokenTTLMinutes <= 0 {
-			c.Auth.TokenTTLMinutes = 720 // 默认12小时
-		}
-		if c.Auth.TokenSecret == "" {
-			// 如果未配置自定义secret，则使用密码作为fallback
-			c.Auth.TokenSecret = c.Auth.Password
-		}
 	}
 
 	return nil

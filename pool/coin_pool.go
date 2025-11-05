@@ -85,7 +85,9 @@ func SetOITopAPI(apiURL string) {
 		return
 	}
 
-	if strings.EqualFold(trimmed, "none") || strings.EqualFold(trimmed, "disable") || strings.EqualFold(trimmed, "disabled") {
+	if strings.EqualFold(trimmed, "none") ||
+		strings.EqualFold(trimmed, "disable") ||
+		strings.EqualFold(trimmed, "disabled") {
 		oiTopConfig.APIURL = ""
 		oiTopConfig.Provider = "disabled"
 		log.Printf("⚠️  已禁用OI Top数据源")
@@ -566,7 +568,6 @@ func fetchOITopFromBinance() ([]OIPosition, error) {
 		symbol := normalizeSymbol(coin.Pair)
 		symbolSet[symbol] = struct{}{}
 	}
-	// 确保默认币种始终被包含
 	for _, symbol := range defaultMainstreamCoins {
 		symbolSet[normalizeSymbol(symbol)] = struct{}{}
 	}
@@ -617,10 +618,6 @@ func fetchOITopFromBinance() ([]OIPosition, error) {
 			position.PriceDeltaPercent = prev.PriceDeltaPercent
 			position.NetLong = prev.NetLong
 			position.NetShort = prev.NetShort
-		} else {
-			position.OIDelta = 0
-			position.OIDeltaPercent = 0
-			position.OIDeltaValue = 0
 		}
 
 		positions = append(positions, position)

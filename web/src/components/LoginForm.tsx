@@ -10,7 +10,7 @@ interface LoginFormProps {
 }
 
 export function LoginForm({ language, onSuccess, onCancel, onLanguageChange }: LoginFormProps) {
-  const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -20,14 +20,14 @@ export function LoginForm({ language, onSuccess, onCancel, onLanguageChange }: L
     setLoading(true);
     setError(null);
     try {
-      const response = await api.login(username, password);
+      const response = await api.login(email, password);
       onSuccess(response);
       setPassword('');
     } catch (err) {
       if (err instanceof Error) {
         setError(err.message);
       } else {
-        setError('登录失败，请检查用户名和密码');
+        setError('登录失败，请检查邮箱和密码');
       }
     } finally {
       setLoading(false);
@@ -84,13 +84,13 @@ export function LoginForm({ language, onSuccess, onCancel, onLanguageChange }: L
         <form className="space-y-5" onSubmit={handleSubmit}>
           <div className="space-y-2">
             <label className="text-sm font-medium" style={{ color: '#EAECEF' }}>
-              用户名
+              邮箱
             </label>
             <input
-              type="text"
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              autoComplete="username"
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              autoComplete="email"
               className="w-full rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#F0B90B]"
               style={{ background: '#0B0E11', color: '#EAECEF', border: '1px solid #2B3139' }}
               required
