@@ -14,6 +14,7 @@ import (
 	"nofx/config"
 	"nofx/manager"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +26,9 @@ type Server struct {
 	router        *gin.Engine
 	traderManager *manager.TraderManager
 	port          int
+	systemConfig  *config.Config
+	userSignals   userSignalSourceConfig
+	userSignalsMu sync.RWMutex
 
 	authEnabled  bool
 	authUsername string
@@ -33,8 +37,45 @@ type Server struct {
 	tokenTTL     time.Duration
 }
 
+type promptTemplateDefinition struct {
+	Description  string
+	SystemPrompt string
+}
+
+type userSignalSourceConfig struct {
+	UseCoinPool bool      `json:"use_coin_pool"`
+	UseOITop    bool      `json:"use_oi_top"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+var builtInPromptTemplateOrder = []string{"default", "aggressive"}
+
+var builtInPromptTemplates = map[string]promptTemplateDefinition{
+	"default": {
+		Description: "Balanced template emphasizing structured analysis and capital preservation.",
+		SystemPrompt: `You are NOFX, a disciplined crypto derivatives trader managing multiple strategies.
+Always produce decisions in clear sections:
+1. Market context (trend, momentum, liquidity)
+2. Risk posture and volatility regime
+3. Exact trade plan (symbol, side, size, leverage, entry, stops, targets)
+4. Account impact and risk checks
+Respect configured leverage caps, margin mode, and drawdown limits.
+Never exceed available balance, never leave JSON fields empty, and always justify actions with on-chain or order book signals.`,
+	},
+	"aggressive": {
+		Description: "Higher-risk template favoring rapid momentum plays with tight controls.",
+		SystemPrompt: `You are NOFX-AGGRO, a high-frequency crypto momentum trader.
+Prioritize fast-moving narratives, breakout structures, and funding imbalances.
+Workflow:
+- Scan for coins with unusual volume, OI spikes, or news catalysts.
+- Enter positions decisively with predefined invalidation levels.
+- Use partial take-profits and trail stops aggressively to protect gains.
+Stay within account limits, honour stop rules, and avoid averaging down losing trades.`,
+	},
+}
+
 // NewServer 创建API服务器
-func NewServer(traderManager *manager.TraderManager, port int, authCfg config.AuthConfig) (*Server, error) {
+func NewServer(traderManager *manager.TraderManager, cfg *config.Config) (*Server, error) {
 	// 设置为Release模式（减少日志输出）
 	gin.SetMode(gin.ReleaseMode)
 
@@ -43,10 +84,28 @@ func NewServer(traderManager *manager.TraderManager, port int, authCfg config.Au
 	// 启用CORS
 	router.Use(corsMiddleware())
 
+	var (
+		port    = 8080
+		authCfg config.AuthConfig
+		signals userSignalSourceConfig
+	)
+
+	if cfg != nil {
+		if cfg.APIServerPort > 0 {
+			port = cfg.APIServerPort
+		}
+		authCfg = cfg.Auth
+		signals.UseCoinPool = cfg.UseDefaultCoins
+		signals.UseOITop = cfg.OITopAPIURL != ""
+		signals.UpdatedAt = time.Now()
+	}
+
 	s := &Server{
 		router:        router,
 		traderManager: traderManager,
 		port:          port,
+		systemConfig:  cfg,
+		userSignals:   signals,
 	}
 
 	if authCfg.Enabled {
@@ -93,64 +152,377 @@ func (s *Server) setupRoutes() {
 
 	s.router.POST("/auth/login", s.handleLogin)
 
-	// API路由组
-	api := s.router.Group("/api")
+	// 公共API路由组（无需认证）
+	publicAPI := s.router.Group("/api")
+	{
+		publicAPI.Any("/health", s.handleHealth)
+		publicAPI.POST("/register", s.handleRegister)
+		publicAPI.POST("/login", s.handleLogin)
+		publicAPI.POST("/verify-otp", s.handleVerifyOTP)
+		publicAPI.POST("/complete-registration", s.handleCompleteRegistration)
+		publicAPI.GET("/supported-models", s.handleGetSupportedModels)
+		publicAPI.GET("/supported-exchanges", s.handleGetSupportedExchanges)
+		publicAPI.GET("/config", s.handleGetSystemConfig)
+		publicAPI.GET("/prompt-templates", s.handleGetPromptTemplates)
+		publicAPI.GET("/prompt-templates/:name", s.handleGetPromptTemplate)
+		publicAPI.GET("/traders", s.handlePublicTraderList)
+		publicAPI.GET("/competition", s.handlePublicCompetition)
+		publicAPI.GET("/equity-history", s.handleEquityHistory)
+	}
+
+	// 受保护的API路由组（需要认证）
+	protected := s.router.Group("/api")
 	if s.authEnabled {
-		api.Use(s.authMiddleware())
+		protected.Use(s.authMiddleware())
 	}
 	{
-		// 健康检查
-		api.Any("/health", s.handleHealth)
-		
-		// 认证相关路由（无需认证）
-		api.POST("/register", s.handleRegister)
-		api.POST("/login", s.handleLogin)
-		api.POST("/verify-otp", s.handleVerifyOTP)
-		api.POST("/complete-registration", s.handleCompleteRegistration)
-		
-		// 系统支持的模型和交易所（无需认证）
-		api.GET("/supported-models", s.handleGetSupportedModels)
-		api.GET("/supported-exchanges", s.handleGetSupportedExchanges)
-		
-		// 系统配置（无需认证）
-		api.GET("/config", s.handleGetSystemConfig)
-		
-		// 系统提示词模板管理（无需认证）
-		api.GET("/prompt-templates", s.handleGetPromptTemplates)
-		api.GET("/prompt-templates/:name", s.handleGetPromptTemplate)
-		
-		// 公开的竞赛数据（无需认证）
-		api.GET("/traders", s.handlePublicTraderList)
-		api.GET("/competition", s.handlePublicCompetition)
-		api.GET("/equity-history", s.handleEquityHistory)
+		protected.GET("/models", s.handleGetModelConfigs)
+		protected.PUT("/models", s.handleUpdateModelConfigs)
+		protected.GET("/exchanges", s.handleGetExchangeConfigs)
+		protected.PUT("/exchanges", s.handleUpdateExchangeConfigs)
+		protected.GET("/user/signal-sources", s.handleGetUserSignalSource)
+		protected.POST("/user/signal-sources", s.handleSaveUserSignalSource)
+		protected.GET("/status", s.handleStatus)
+		protected.GET("/account", s.handleAccount)
+		protected.GET("/positions", s.handlePositions)
+		protected.GET("/decisions", s.handleDecisions)
+		protected.GET("/decisions/latest", s.handleLatestDecisions)
+		protected.GET("/statistics", s.handleStatistics)
+		protected.GET("/performance", s.handlePerformance)
+	}
+}
 
-		// Trader列表
-		api.GET("/traders", s.handleTraderList)
+// handleRegister 注册接口（暂未启用）
+func (s *Server) handleRegister(c *gin.Context) {
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error": "registration flow is not enabled",
+	})
+}
 
-			// AI模型配置
-			protected.GET("/models", s.handleGetModelConfigs)
-			protected.PUT("/models", s.handleUpdateModelConfigs)
+// handleVerifyOTP OTP验证接口（暂未启用）
+func (s *Server) handleVerifyOTP(c *gin.Context) {
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error": "otp verification is not enabled",
+	})
+}
 
-			// 交易所配置
-			protected.GET("/exchanges", s.handleGetExchangeConfigs)
-			protected.PUT("/exchanges", s.handleUpdateExchangeConfigs)
+// handleCompleteRegistration 完成注册接口（暂未启用）
+func (s *Server) handleCompleteRegistration(c *gin.Context) {
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error": "registration completion is not enabled",
+	})
+}
 
-			// 用户信号源配置
-			protected.GET("/user/signal-sources", s.handleGetUserSignalSource)
-			protected.POST("/user/signal-sources", s.handleSaveUserSignalSource)
+// handleGetSupportedModels 返回支持的AI模型列表
+func (s *Server) handleGetSupportedModels(c *gin.Context) {
+	type modelInfo struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Provider    string `json:"provider"`
+		Description string `json:"description"`
+	}
 
+	models := []modelInfo{
+		{
+			ID:          "deepseek",
+			Name:        "DeepSeek (deepseek-chat)",
+			Provider:    "DeepSeek",
+			Description: "Balanced reasoning-first model optimised for structured trading analysis.",
+		},
+		{
+			ID:          "qwen",
+			Name:        "Qwen (qwen-plus)",
+			Provider:    "Alibaba Cloud",
+			Description: "Multilingual model suited for bilingual trading workflows and Chinese market data.",
+		},
+		{
+			ID:          "custom",
+			Name:        "Custom OpenAI-Compatible Model",
+			Provider:    "User Supplied",
+			Description: "Use your own API endpoint, API key, and model name as defined in config.json.",
+		},
+	}
 
-			
-			// 指定trader的数据（使用query参数 ?trader_id=xxx）
-			protected.GET("/status", s.handleStatus)
-			protected.GET("/account", s.handleAccount)
-			protected.GET("/positions", s.handlePositions)
-			protected.GET("/decisions", s.handleDecisions)
-			protected.GET("/decisions/latest", s.handleLatestDecisions)
-			protected.GET("/statistics", s.handleStatistics)
-			protected.GET("/performance", s.handlePerformance)
+	c.JSON(http.StatusOK, gin.H{
+		"models": models,
+	})
+}
+
+// handleGetSupportedExchanges 返回支持的交易所列表
+func (s *Server) handleGetSupportedExchanges(c *gin.Context) {
+	type exchangeInfo struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		Description string `json:"description"`
+	}
+
+	exchanges := []exchangeInfo{
+		{
+			ID:          "binance",
+			Name:        "Binance Futures",
+			Type:        "cex",
+			Description: "Centralised exchange USDT-margined perpetual contracts with deep liquidity.",
+		},
+		{
+			ID:          "hyperliquid",
+			Name:        "Hyperliquid Perps",
+			Type:        "dex",
+			Description: "On-chain perpetual DEX with fast settlement and transparent funding.",
+		},
+		{
+			ID:          "aster",
+			Name:        "Aster Perps",
+			Type:        "dex",
+			Description: "Aster network perpetual exchange (testnet recommended for evaluation).",
+		},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"exchanges": exchanges,
+	})
+}
+
+// handleGetModelConfigs 返回模型配置摘要（不包含敏感信息）
+func (s *Server) handleGetModelConfigs(c *gin.Context) {
+	type modelConfig struct {
+		ID             string `json:"id"`
+		Name           string `json:"name"`
+		Provider       string `json:"provider"`
+		Description    string `json:"description"`
+		RequiresAPIKey bool   `json:"requires_api_key"`
+		Enabled        bool   `json:"enabled"`
+	}
+
+	models := []modelConfig{
+		{
+			ID:             "deepseek",
+			Name:           "DeepSeek (deepseek-chat)",
+			Provider:       "DeepSeek",
+			Description:    "Requires a DeepSeek API key. Suitable for deep reasoning on complex trade setups.",
+			RequiresAPIKey: true,
+		},
+		{
+			ID:             "qwen",
+			Name:           "Qwen (qwen-plus)",
+			Provider:       "Alibaba Cloud",
+			Description:    "Requires DashScope access token. Strong bilingual support for Chinese market narratives.",
+			RequiresAPIKey: true,
+		},
+		{
+			ID:             "custom",
+			Name:           "Custom OpenAI-Compatible",
+			Provider:       "User Supplied",
+			Description:    "Provide your own API URL, key, and model name (OpenAI-compatible schema).",
+			RequiresAPIKey: true,
+		},
+	}
+
+	if s.systemConfig != nil {
+		for _, traderCfg := range s.systemConfig.Traders {
+			if !traderCfg.Enabled {
+				continue
+			}
+			for idx := range models {
+				if models[idx].ID == traderCfg.AIModel {
+					models[idx].Enabled = true
+				}
+			}
 		}
 	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"models": models,
+	})
+}
+
+// handleUpdateModelConfigs 更新模型配置（当前仅返回未实现）
+func (s *Server) handleUpdateModelConfigs(c *gin.Context) {
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error": "model configuration updates are not available via API yet",
+	})
+}
+
+// handleGetExchangeConfigs 返回交易所配置摘要（不包含密钥）
+func (s *Server) handleGetExchangeConfigs(c *gin.Context) {
+	type exchangeConfig struct {
+		ID             string `json:"id"`
+		Name           string `json:"name"`
+		Type           string `json:"type"`
+		Description    string `json:"description"`
+		RequiresAPIKey bool   `json:"requires_api_key"`
+		Enabled        bool   `json:"enabled"`
+	}
+
+	exchanges := []exchangeConfig{
+		{
+			ID:             "binance",
+			Name:           "Binance Futures",
+			Type:           "cex",
+			Description:    "Requires API key and secret. Supports rich derivatives instruments.",
+			RequiresAPIKey: true,
+		},
+		{
+			ID:             "hyperliquid",
+			Name:           "Hyperliquid Perps",
+			Type:           "dex",
+			Description:    "Requires private key and wallet address. On-chain settlement DEX.",
+			RequiresAPIKey: true,
+		},
+		{
+			ID:             "aster",
+			Name:           "Aster Perps",
+			Type:           "dex",
+			Description:    "Requires signer credentials. Optimised for testnet experimentation.",
+			RequiresAPIKey: true,
+		},
+	}
+
+	if s.systemConfig != nil {
+		for _, traderCfg := range s.systemConfig.Traders {
+			if !traderCfg.Enabled {
+				continue
+			}
+			for idx := range exchanges {
+				if exchanges[idx].ID == traderCfg.Exchange {
+					exchanges[idx].Enabled = true
+				}
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"exchanges": exchanges,
+	})
+}
+
+// handleUpdateExchangeConfigs 更新交易所配置（当前仅返回未实现）
+func (s *Server) handleUpdateExchangeConfigs(c *gin.Context) {
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error": "exchange configuration updates are not available via API yet",
+	})
+}
+
+// handleGetUserSignalSource 获取用户信号源偏好
+func (s *Server) handleGetUserSignalSource(c *gin.Context) {
+	s.userSignalsMu.RLock()
+	current := s.userSignals
+	s.userSignalsMu.RUnlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"config": current,
+	})
+}
+
+// handleSaveUserSignalSource 保存用户信号源偏好（进程内存储）
+func (s *Server) handleSaveUserSignalSource(c *gin.Context) {
+	var req struct {
+		UseCoinPool bool `json:"use_coin_pool"`
+		UseOITop    bool `json:"use_oi_top"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		return
+	}
+
+	s.userSignalsMu.Lock()
+	s.userSignals.UseCoinPool = req.UseCoinPool
+	s.userSignals.UseOITop = req.UseOITop
+	s.userSignals.UpdatedAt = time.Now()
+	updated := s.userSignals
+	s.userSignalsMu.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"config": updated,
+	})
+}
+
+// handleGetSystemConfig 返回安全的系统配置（不包含敏感信息）
+func (s *Server) handleGetSystemConfig(c *gin.Context) {
+	defaultCoins := []string{
+		"BTCUSDT",
+		"ETHUSDT",
+		"SOLUSDT",
+		"BNBUSDT",
+		"XRPUSDT",
+		"DOGEUSDT",
+		"ADAUSDT",
+		"HYPEUSDT",
+	}
+	useDefaultCoins := true
+	coinPoolAPI := ""
+	oiTopAPI := ""
+
+	if s.systemConfig != nil {
+		if len(s.systemConfig.DefaultCoins) > 0 {
+			defaultCoins = append([]string(nil), s.systemConfig.DefaultCoins...)
+		}
+		useDefaultCoins = s.systemConfig.UseDefaultCoins
+		coinPoolAPI = s.systemConfig.CoinPoolAPIURL
+		oiTopAPI = s.systemConfig.OITopAPIURL
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"use_default_coins": useDefaultCoins,
+		"default_coins":     defaultCoins,
+		"coin_pool_api_url": coinPoolAPI,
+		"oi_top_api_url":    oiTopAPI,
+	})
+}
+
+// handleGetPromptTemplates 返回内置提示词模板列表
+func (s *Server) handleGetPromptTemplates(c *gin.Context) {
+	type templateInfo struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+
+	templates := make([]templateInfo, 0, len(builtInPromptTemplateOrder))
+	for _, name := range builtInPromptTemplateOrder {
+		if tpl, ok := builtInPromptTemplates[name]; ok {
+			templates = append(templates, templateInfo{
+				Name:        name,
+				Description: tpl.Description,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"templates": templates,
+	})
+}
+
+// handleGetPromptTemplate 返回指定提示词模板的详细内容
+func (s *Server) handleGetPromptTemplate(c *gin.Context) {
+	name := strings.ToLower(strings.TrimSpace(c.Param("name")))
+	if name == "" {
+		name = "default"
+	}
+
+	tpl, ok := builtInPromptTemplates[name]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": fmt.Sprintf("prompt template '%s' not found", name),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"name":          name,
+		"description":   tpl.Description,
+		"system_prompt": tpl.SystemPrompt,
+	})
+}
+
+// handlePublicTraderList 公共Trader列表
+func (s *Server) handlePublicTraderList(c *gin.Context) {
+	s.handleTraderList(c)
+}
+
+// handlePublicCompetition 公共竞赛数据
+func (s *Server) handlePublicCompetition(c *gin.Context) {
+	s.handleCompetition(c)
 }
 
 // authMiddleware 鉴权中间件
@@ -650,4 +1022,3 @@ func (s *Server) signToken(data []byte) []byte {
 	mac.Write(data)
 	return mac.Sum(nil)
 }
-

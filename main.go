@@ -110,7 +110,7 @@ func main() {
 	fmt.Println()
 
 	// 创建并启动API服务器
-	apiServer, err := api.NewServer(traderManager, cfg.APIServerPort, cfg.Auth)
+	apiServer, err := api.NewServer(traderManager, cfg)
 	if err != nil {
 		log.Fatalf("❌ 初始化API服务器失败: %v", err)
 	}
